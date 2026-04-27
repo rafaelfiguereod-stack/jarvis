@@ -103,18 +103,16 @@ export class GroqProvider implements LLMProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
-      if (this.isRequestTooLargeError(response.status, errorText)) {
-        response = await this.sendRequest(
-          this.buildRequestBody(messages, options, false, GroqProvider.RETRY_PROMPT_CHAR_BUDGET)
-        );
-      } else {
+      if (!this.isRequestTooLargeError(response.status, errorText)) {
         throw new Error(`Groq API error (${response.status}): ${errorText}`);
       }
-    }
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Groq API error (${response.status}): ${errorText}`);
+      response = await this.sendRequest(
+        this.buildRequestBody(messages, options, false, GroqProvider.RETRY_PROMPT_CHAR_BUDGET)
+      );
+      if (!response.ok) {
+        const retryError = await response.text();
+        throw new Error(`Groq API error after retry (${response.status}): ${retryError}`);
+      }
     }
 
     const data = await response.json() as GroqResponse;
@@ -134,25 +132,23 @@ export class GroqProvider implements LLMProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
-      if (this.isRequestTooLargeError(response.status, errorText)) {
-        response = await this.sendRequest(
-          this.buildRequestBody(
-            messages,
-            options,
-            true,
-            GroqProvider.RETRY_PROMPT_CHAR_BUDGET,
-          )
-        );
-      } else {
+      if (!this.isRequestTooLargeError(response.status, errorText)) {
         yield { type: 'error', error: `Groq API error (${response.status}): ${errorText}` };
         return;
       }
-    }
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      yield { type: 'error', error: `Groq API error (${response.status}): ${errorText}` };
-      return;
+      response = await this.sendRequest(
+        this.buildRequestBody(
+          messages,
+          options,
+          true,
+          GroqProvider.RETRY_PROMPT_CHAR_BUDGET,
+        )
+      );
+      if (!response.ok) {
+        const retryError = await response.text();
+        yield { type: 'error', error: `Groq API error after retry (${response.status}): ${retryError}` };
+        return;
+      }
     }
 
     if (!response.body) {
@@ -351,6 +347,14 @@ export class GroqProvider implements LLMProvider {
       )
       : 0;
     const budget = Math.max(6_000, promptBudget - toolOverhead);
+
+    // Fast path: if the conversation already fits under budget at full size,
+    // return it untouched. This avoids unconditionally truncating individual
+    // messages with the visible "...[truncated for Groq]..." marker on every
+    // request — the per-role caps only apply when we actually have to shrink.
+    const rawTotal = messages.reduce((sum, m) => sum + this.measureMessage(m), 0);
+    if (rawTotal <= budget) return messages;
+
     const normalized = messages.map((message) => this.normalizeMessage(message));
     const systemMessages = normalized.filter((message) => message.role === 'system');
     const nonSystemMessages = normalized.filter((message) => message.role !== 'system');
@@ -361,32 +365,67 @@ export class GroqProvider implements LLMProvider {
       return systemMessages;
     }
 
-    const recentCount = Math.min(nonSystemMessages.length, GroqProvider.MIN_RECENT_MESSAGES);
-    const olderMessages = nonSystemMessages.slice(0, nonSystemMessages.length - recentCount);
-    const recentMessages = nonSystemMessages.slice(-recentCount);
-    const recentBudget = Math.max(Math.floor(remainingBudget / Math.max(recentCount, 1)) - 64, 240);
+    // Group an assistant-with-tool_calls together with its immediately-following
+    // tool responses (matched by tool_call_id) so we can drop/keep tool pairs
+    // atomically. Groq rejects requests where a tool_call_id has no matching
+    // assistant tool_call (or vice versa) as malformed.
+    const groups = this.groupForAtomicCompaction(nonSystemMessages);
+
+    const recentGroupCount = Math.min(groups.length, GroqProvider.MIN_RECENT_MESSAGES);
+    const olderGroups = groups.slice(0, groups.length - recentGroupCount);
+    const recentGroups = groups.slice(-recentGroupCount);
+    // 64 = per-message framing overhead reserved for role/JSON keys; 240 = floor
+    // so the recent budget never collapses to nothing on a very tight payload.
+    const recentBudget = Math.max(Math.floor(remainingBudget / Math.max(recentGroupCount, 1)) - 64, 240);
     const selectedOlder: LLMMessage[] = [];
     const selectedRecent: LLMMessage[] = [];
 
-    for (const message of recentMessages) {
-      const candidate = this.normalizeMessage(message, recentBudget);
-      const candidateSize = this.measureMessage(candidate);
-      if (candidateSize <= remainingBudget) {
-        selectedRecent.push(candidate);
-        remainingBudget -= candidateSize;
+    for (const group of recentGroups) {
+      const candidates = group.map((m) => this.normalizeMessage(m, recentBudget));
+      const groupSize = candidates.reduce((sum, m) => sum + this.measureMessage(m), 0);
+      if (groupSize <= remainingBudget) {
+        selectedRecent.push(...candidates);
+        remainingBudget -= groupSize;
       }
     }
 
-    for (let i = olderMessages.length - 1; i >= 0; i--) {
-      const candidate = olderMessages[i]!;
-      const candidateSize = this.measureMessage(candidate);
-      if (candidateSize <= remainingBudget) {
-        selectedOlder.unshift(candidate);
-        remainingBudget -= candidateSize;
+    for (let i = olderGroups.length - 1; i >= 0; i--) {
+      const group = olderGroups[i]!;
+      const groupSize = group.reduce((sum, m) => sum + this.measureMessage(m), 0);
+      if (groupSize <= remainingBudget) {
+        selectedOlder.unshift(...group);
+        remainingBudget -= groupSize;
       }
     }
 
     return [...systemMessages, ...selectedOlder, ...selectedRecent];
+  }
+
+  private groupForAtomicCompaction(messages: LLMMessage[]): LLMMessage[][] {
+    const groups: LLMMessage[][] = [];
+    let i = 0;
+    while (i < messages.length) {
+      const current = messages[i]!;
+      if (current.role === 'assistant' && current.tool_calls && current.tool_calls.length > 0) {
+        const toolCallIds = new Set(current.tool_calls.map((tc) => tc.id));
+        const grouped: LLMMessage[] = [current];
+        i++;
+        while (
+          i < messages.length
+          && messages[i]!.role === 'tool'
+          && messages[i]!.tool_call_id !== undefined
+          && toolCallIds.has(messages[i]!.tool_call_id!)
+        ) {
+          grouped.push(messages[i]!);
+          i++;
+        }
+        groups.push(grouped);
+      } else {
+        groups.push([current]);
+        i++;
+      }
+    }
+    return groups;
   }
 
   private normalizeMessage(message: LLMMessage, overrideBudget?: number): LLMMessage {
@@ -414,13 +453,15 @@ export class GroqProvider implements LLMProvider {
     }
   }
 
+  private static readonly TRUNCATION_MARKER = '\n...[truncated for Groq]...\n';
+
   private truncateText(text: string, maxChars: number): string {
     if (text.length <= maxChars) return text;
     if (maxChars <= 80) return text.slice(0, maxChars);
     const head = Math.floor(maxChars * 0.65);
-    const tail = Math.max(maxChars - head - 29, 0);
+    const tail = Math.max(maxChars - head - GroqProvider.TRUNCATION_MARKER.length, 0);
     const suffix = tail > 0 ? text.slice(-tail) : '';
-    return `${text.slice(0, head)}\n...[truncated for Groq]...\n${suffix}`;
+    return `${text.slice(0, head)}${GroqProvider.TRUNCATION_MARKER}${suffix}`;
   }
 
   private measureMessage(message: LLMMessage): number {
@@ -431,8 +472,14 @@ export class GroqProvider implements LLMProvider {
     return content.length + toolCallsSize + 128;
   }
 
+  // Treat 413 Payload Too Large as authoritative. For 400 Bad Request we
+  // also accept a narrow set of size-related phrases Groq uses in practice;
+  // a smaller retry budget can recover from those. Everything else
+  // (auth, rate limit, generic 400/500) is not retryable here.
   private isRequestTooLargeError(status: number, errorText: string): boolean {
-    return status === 413 || /message is too large|request too large|context length|too many tokens|payload too large/i.test(errorText);
+    if (status === 413) return true;
+    if (status !== 400) return false;
+    return /\b(message is too large|request too large|payload too large|too many tokens|maximum context length|context window)\b/i.test(errorText);
   }
 
   private convertTools(tools: LLMTool[]): GroqToolDef[] {

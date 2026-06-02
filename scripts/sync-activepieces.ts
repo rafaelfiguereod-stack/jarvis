@@ -61,11 +61,11 @@ const VENDOR_PATHS: string[] = [
   "packages/pieces/community/openai",
   "packages/pieces/community/slack",
   "packages/pieces/community/telegram-bot",
-  // Locale assets only. Upstream's `packages/web` (the Activepieces React/Vite
-  // app) is intentionally NOT vendored: Jarvis ships its own workflow builder
-  // under ui/src/v2/rooms/workflows and never imports the upstream frontend.
-  // Do not re-add "packages/web" here without also wiring it into a build.
-  "packages/react-ui",
+  // NOTE: the upstream frontend is intentionally NOT vendored -- neither
+  // `packages/web` (the React/Vite visual-builder app) nor `packages/react-ui`
+  // (its i18n locale JSON). Jarvis ships its own workflow builder under
+  // ui/src/v2/rooms/workflows and never imports the upstream frontend. Do not
+  // re-add either here without also wiring it into a build.
 ];
 
 const EE_SEGMENT = /(^|\/)ee(\/|$)/;

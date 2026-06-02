@@ -11,6 +11,8 @@ export class DiscordAdapter implements ChannelAdapter {
   private allowedUsers: string[];
   private guildId: string | null;
   private sttProvider: STTProvider | null;
+  /** One-time warning latch so a busy server doesn't flood logs. */
+  private warnedNoAllowlist = false;
 
   constructor(token: string, opts?: {
     allowedUsers?: string[];
@@ -124,8 +126,16 @@ export class DiscordAdapter implements ChannelAdapter {
     if (message.author.bot) return;
     if (!this.handler) return;
 
-    // Security: check allowed users (empty = allow all)
-    if (this.allowedUsers.length > 0 && !this.allowedUsers.includes(message.author.id)) {
+    // Security: deny-by-default. An empty allowlist authorizes NO ONE
+    // (previously empty = allow-all, which let any sender drive the agent).
+    if (this.allowedUsers.length === 0) {
+      if (!this.warnedNoAllowlist) {
+        this.warnedNoAllowlist = true;
+        console.warn('[DiscordAdapter] Ignoring all messages: no allowed_users configured. Add Discord user IDs to channels.discord.allowed_users to authorize senders.');
+      }
+      return;
+    }
+    if (!this.allowedUsers.includes(message.author.id)) {
       return;
     }
 

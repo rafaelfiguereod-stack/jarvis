@@ -67,7 +67,13 @@ export const CATEGORY_ACTION_MAP: Record<string, ActionCategory> = {
 
 /**
  * Resolve the ActionCategory for a given tool.
- * Checks explicit tool name map first, then falls back to category map, then defaults to read_data.
+ * Checks explicit tool name map first, then falls back to category map.
+ *
+ * Fail CLOSED: a tool we don't recognise is treated as `execute_command`
+ * (destructive + governed by default), so an unmapped or newly-added
+ * capability requires high authority and explicit approval instead of being
+ * silently waved through as a harmless `read_data`. Map new tools explicitly
+ * above to grant them a narrower category.
  */
 export function getActionForTool(toolName: string, toolCategory: string): ActionCategory {
   if (TOOL_ACTION_MAP[toolName]) {
@@ -76,5 +82,5 @@ export function getActionForTool(toolName: string, toolCategory: string): Action
   if (CATEGORY_ACTION_MAP[toolCategory]) {
     return CATEGORY_ACTION_MAP[toolCategory];
   }
-  return 'read_data';
+  return 'execute_command';
 }

@@ -224,8 +224,11 @@ describe('getActionForTool', () => {
     expect(getActionForTool('some_terminal_tool', 'terminal')).toBe('execute_command');
   });
 
-  test('defaults to read_data for completely unknown tools', () => {
-    expect(getActionForTool('unknown_tool', 'unknown_category')).toBe('read_data');
+  test('fails closed to execute_command for completely unknown tools', () => {
+    // Unmapped tools are treated as destructive + governed so a new/unknown
+    // capability requires high authority and explicit approval rather than
+    // being waved through as a harmless read.
+    expect(getActionForTool('unknown_tool', 'unknown_category')).toBe('execute_command');
   });
 });
 

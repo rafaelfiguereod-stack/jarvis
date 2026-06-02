@@ -57,6 +57,10 @@ function applyEnvOverrides(config: JarvisConfig): void {
     if (!isNaN(port)) config.daemon.port = port;
   }
 
+  if (env.JARVIS_HOST) {
+    config.daemon.host = env.JARVIS_HOST;
+  }
+
   if (env.JARVIS_HOME) {
     const home = env.JARVIS_HOME;
     config.daemon.data_dir = home;

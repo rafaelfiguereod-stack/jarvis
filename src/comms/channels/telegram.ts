@@ -68,6 +68,8 @@ export class TelegramAdapter implements ChannelAdapter {
   private pollingInterval: number = 1000;
   private sttProvider: STTProvider | null = null;
   private allowedUsers: number[];
+  /** One-time warning latch so a busy chat doesn't flood logs. */
+  private warnedNoAllowlist = false;
 
   constructor(token: string, opts?: { sttProvider?: STTProvider; allowedUsers?: number[] }) {
     this.token = token;
@@ -208,8 +210,16 @@ export class TelegramAdapter implements ChannelAdapter {
 
     const { message } = update;
 
-    // Security: check allowed users
-    if (this.allowedUsers.length > 0 && !this.allowedUsers.includes(message.from.id)) {
+    // Security: deny-by-default. An empty allowlist authorizes NO ONE
+    // (previously empty = allow-all, which let any sender drive the agent).
+    if (this.allowedUsers.length === 0) {
+      if (!this.warnedNoAllowlist) {
+        this.warnedNoAllowlist = true;
+        console.warn('[TelegramAdapter] Ignoring all messages: no allowed_users configured. Add numeric Telegram user IDs to channels.telegram.allowed_users to authorize senders.');
+      }
+      return;
+    }
+    if (!this.allowedUsers.includes(message.from.id)) {
       console.log(`[TelegramAdapter] Ignoring message from unauthorized user: ${message.from.id} (${message.from.username ?? message.from.first_name})`);
       return;
     }

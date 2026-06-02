@@ -52,13 +52,16 @@ export class WSLBridge {
     }
 
     try {
-      const escapedScript = script
-        .replace(/\\/g, '\\\\')
-        .replace(/"/g, '\\"')
-        .replace(/\$/g, '\\$')
-        .replace(/`/g, '\\`');
-
-      return await this.executor.execute(`powershell.exe -Command "${escapedScript}"`);
+      // Pass the script via -EncodedCommand (base64 of UTF-16LE) instead of
+      // hand-escaping quotes/backticks/dollar-signs into a -Command string.
+      // Encoding sidesteps every shell-quoting edge case (the prior manual
+      // escaping was incomplete — e.g. it did not handle `;`, `&`, `|`, `(`)
+      // and the resulting base64 is plain [A-Za-z0-9+/=], safe to embed in the
+      // bash `-c` line with no further escaping. -NoProfile/-NonInteractive
+      // keep the child shell from sourcing the user profile or blocking on a
+      // prompt.
+      const encoded = Buffer.from(script, 'utf16le').toString('base64');
+      return await this.executor.execute(`powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`);
     } catch (error) {
       throw new Error(`Failed to run PowerShell script: ${error instanceof Error ? error.message : String(error)}`);
     }

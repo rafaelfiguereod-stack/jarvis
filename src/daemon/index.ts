@@ -6,9 +6,11 @@
  * starts health monitoring, and handles graceful shutdown.
  */
 
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
+import { secureWriteFile } from "../util/fs-secure.ts";
 import { initDatabase, closeDb } from "../vault/schema.ts";
 import { ServiceRegistry } from "./services.ts";
 import { HealthMonitor } from "./health.ts";
@@ -61,6 +63,7 @@ const DEFAULT_DATA_DIR = path.join(os.homedir(), '.jarvis');
 
 export interface DaemonConfig {
   port: number;
+  host?: string;                 // bind address (default 127.0.0.1)
   dbPath: string;
   dataDir: string;
   healthCheckInterval?: number;  // ms
@@ -92,6 +95,9 @@ function parseArgs(): Partial<DaemonConfig> {
       case '--port':
         config.port = parseInt(args[++i]!, 10);
         break;
+      case '--host':
+        config.host = args[++i]!;
+        break;
       case '--db-path':
         config.dbPath = args[++i]!;
         break;
@@ -114,6 +120,7 @@ Usage:
 
 Options:
   --port <number>          WebSocket server port (default: ${DEFAULT_PORT})
+  --host <address>         Bind address (default: 127.0.0.1; use 0.0.0.0 to expose on the network)
   --db-path <path>         Database file path (default: ~/.jarvis/jarvis.db)
   --data-dir <path>        Data directory (default: ~/.jarvis)
   --health-interval <ms>   Health check interval in ms (default: 30000)
@@ -281,8 +288,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
   // Merge configuration
   const port = userConfig?.port ?? jarvisConfig.daemon.port ?? DEFAULT_PORT;
+  // Bind address: CLI --host > JARVIS_HOST/config (already merged into
+  // jarvisConfig.daemon.host by the loader) > loopback default. Loopback by
+  // default means a fresh install is not reachable from the network.
+  const host = userConfig?.host ?? jarvisConfig.daemon.host ?? '127.0.0.1';
   const config: DaemonConfig = {
     port,
+    host,
     dataDir,
     dbPath,
     healthCheckInterval: userConfig?.healthCheckInterval ?? 30000,
@@ -356,7 +368,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const observerService = config.noLocalTools
       ? null
       : new ObserverService(reactor, coalescer, googleAuth ?? undefined, config.dataDir);
-    const wsService = new WebSocketService(config.port, agentService);
+    const wsService = new WebSocketService(config.port, agentService, config.host);
 
     // 5b. Create channel service for external comms (Telegram, Discord)
     const channelService = new ChannelService(jarvisConfig, agentService);
@@ -431,7 +443,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const authorityConfig = jarvisConfig.authority ?? { default_level: 3 };
     const authorityEngine = new AuthorityEngine({
       default_level: authorityConfig.default_level,
-      governed_categories: (authorityConfig.governed_categories ?? ['send_email', 'send_message', 'make_payment']) as any,
+      governed_categories: (authorityConfig.governed_categories ?? ['send_email', 'send_message', 'make_payment', 'execute_command', 'install_software', 'delete_data', 'modify_settings', 'terminate_agent']) as any,
       overrides: (authorityConfig.overrides ?? []) as any,
       context_rules: (authorityConfig.context_rules ?? []) as any,
       learning: authorityConfig.learning ?? { enabled: true, suggest_threshold: 5 },
@@ -733,13 +745,47 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const uiPublicDir = path.join(import.meta.dir, '../../ui/public');
     wsService.setPublicDir(uiPublicDir);
 
-    // 9c. Configure auth token if set
-    const authToken = jarvisConfig.auth?.token;
+    // 9c. Configure dashboard auth.
+    //
+    // Precedence: an explicitly configured token (config.auth.token /
+    // JARVIS_AUTH_TOKEN) always wins. Otherwise, if the daemon is bound to a
+    // non-loopback address it is reachable from the network, so it must NOT
+    // run unauthenticated: auto-generate a token, persist it (0600) under the
+    // data dir so it stays stable across restarts, and print it prominently
+    // (readable via `docker logs` / the console) so the operator can still
+    // reach the dashboard. Loopback binds with no token stay open locally —
+    // the CSRF Origin check still blocks cross-site browser requests.
+    const isLoopbackHost = (h: string): boolean =>
+      h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '::ffff:127.0.0.1';
+    let authToken = jarvisConfig.auth?.token;
+    if (!authToken && !isLoopbackHost(config.host ?? '127.0.0.1')) {
+      const tokenPath = path.join(config.dataDir, '.auth-token');
+      try {
+        if (existsSync(tokenPath)) {
+          authToken = readFileSync(tokenPath, 'utf-8').trim();
+        }
+        if (!authToken) {
+          authToken = randomBytes(32).toString('base64url');
+          await secureWriteFile(tokenPath, authToken + '\n', 0o600, 'Daemon');
+        }
+      } catch (err) {
+        // If persistence fails, still use an in-memory token — better than
+        // running unauthenticated on a network-reachable bind.
+        if (!authToken) authToken = randomBytes(32).toString('base64url');
+        console.warn(`[Daemon] Could not persist auth token: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      console.warn('[Daemon] ════════════════════════════════════════════════════');
+      console.warn(`[Daemon] Bound to ${config.host} with no auth.token configured.`);
+      console.warn('[Daemon] Auto-generated a dashboard auth token. Visit once to set the cookie:');
+      console.warn(`[Daemon]     http://<host>:${config.port}/?token=${authToken}`);
+      console.warn(`[Daemon] (saved to ${path.join(config.dataDir, '.auth-token')}; set auth.token or JARVIS_AUTH_TOKEN to choose your own)`);
+      console.warn('[Daemon] ════════════════════════════════════════════════════');
+    }
     if (authToken) {
       wsService.setAuthToken(authToken);
       console.log('[Daemon] Auth token configured — dashboard routes require ?token= or cookie');
     } else {
-      console.warn('[Daemon] No auth token configured — dashboard is open to anyone on the network');
+      console.log(`[Daemon] No auth token set — dashboard reachable on loopback only (${config.host}); cross-site requests are blocked by the Origin check.`);
     }
 
     // 9b. Apply --no-local-tools flag if set

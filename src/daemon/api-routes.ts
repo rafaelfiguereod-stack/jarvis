@@ -2457,7 +2457,15 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
           // Merge updates into current config
           if (body.governed_categories) currentConfig.governed_categories = body.governed_categories as ActionCategory[];
-          if (body.default_level !== undefined) currentConfig.default_level = body.default_level as number;
+          if (body.default_level !== undefined) {
+            // Clamp to the authority scale (0-10). Without this an arbitrary
+            // (or hostile) value could over-grant the agent's effective
+            // authority floor, since the engine uses
+            // max(role_level, default_level) when checking requirements.
+            const lvl = Number(body.default_level);
+            if (!Number.isFinite(lvl)) return error('default_level must be a number');
+            currentConfig.default_level = Math.max(0, Math.min(10, Math.floor(lvl)));
+          }
           if (body.overrides) currentConfig.overrides = body.overrides as any[];
           if (body.context_rules) currentConfig.context_rules = body.context_rules as any[];
           if (body.learning) currentConfig.learning = { ...currentConfig.learning, ...body.learning as any };

@@ -51,6 +51,7 @@ ${c.bold('Commands:')}
 
 ${c.bold('Start options:')}
   --port <N>        Override daemon port (default: 3142)
+  --host <addr>     Bind address (default: 127.0.0.1; use 0.0.0.0 to expose on the network)
   -d, --detach      Run as background daemon
   --no-open         Don't auto-open dashboard in browser
   --data-dir <path> Override data directory (default: ~/.jarvis)
@@ -103,6 +104,13 @@ async function cmdStart(args: string[]): Promise<void> {
     dataDir = args[dataDirIdx + 1]!;
   }
 
+  // Parse --host (bind address). Defaults to loopback inside the daemon.
+  let host: string | undefined;
+  const hostIdx = args.indexOf('--host');
+  if (hostIdx !== -1 && args[hostIdx + 1]) {
+    host = args[hostIdx + 1]!;
+  }
+
   // Friendly first-run hint — when no config exists yet, the daemon
   // boots in "setup mode" and the dashboard's onboarding gate handles
   // LLM/TTS/profile/tutorial. Print a one-liner so the user knows where
@@ -128,7 +136,7 @@ async function cmdStart(args: string[]): Promise<void> {
     process.on('SIGTERM', () => { releaseLock(); process.exit(0); });
 
     const { startDaemon } = await import('../src/daemon/index.ts');
-    await startDaemon({ port, dataDir, noLocalTools });
+    await startDaemon({ port, host, dataDir, noLocalTools });
 
     if (!noOpen) {
       openDashboard(port ?? 3142);
@@ -150,6 +158,9 @@ async function cmdStart(args: string[]): Promise<void> {
 
     const daemonArgs = [join(PACKAGE_ROOT, 'bin/jarvis.ts'), 'start', '--no-open'];
     if (port) daemonArgs.push('--port', String(port));
+    if (host) daemonArgs.push('--host', host);
+    if (dataDir) daemonArgs.push('--data-dir', dataDir);
+    if (noLocalTools) daemonArgs.push('--no-local-tools');
 
     const logFd = openSync(logPath, 'a');
     const child = spawn('bun', daemonArgs, {

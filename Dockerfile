@@ -110,8 +110,14 @@ VOLUME ["/data"]
 
 USER jarvis
 
+# Use the public /health endpoint (no auth) — /api/health requires the auth
+# token, which is auto-generated when binding 0.0.0.0 below.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD bun -e "fetch('http://localhost:3142/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+    CMD bun -e "fetch('http://localhost:3142/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["jarvis"]
-CMD ["start", "--no-open", "--data-dir", "/data", "--no-local-tools"]
+# Bind 0.0.0.0 so the published port is reachable from the host. The container
+# is network-isolated and the operator controls exposure via `-p`; because this
+# is a non-loopback bind, the daemon auto-generates a dashboard auth token at
+# startup (printed in the logs) unless JARVIS_AUTH_TOKEN is set.
+CMD ["start", "--no-open", "--host", "0.0.0.0", "--data-dir", "/data", "--no-local-tools"]

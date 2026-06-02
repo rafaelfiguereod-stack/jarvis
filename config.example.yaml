@@ -3,6 +3,12 @@
 
 daemon:
   port: 3142
+  # Bind address. Defaults to 127.0.0.1 (loopback only) so a fresh install is
+  # not reachable from other machines. Set to 0.0.0.0 to expose on the network
+  # (the Docker image does this). Binding a non-loopback host without auth.token
+  # below makes the daemon auto-generate a token at startup (printed to logs).
+  # Env override: JARVIS_HOST=0.0.0.0
+  host: "127.0.0.1"
   data_dir: "~/.jarvis"
   db_path: "~/.jarvis/jarvis.db"
   # Public origin written into sidecar enrollment JWTs (`brain` + `jwks`).
@@ -12,8 +18,11 @@ daemon:
   # brain_domain: "https://brain.example.com"
 
 # Authentication — protects dashboard, API, and WebSocket.
-# If unset, the application is open (no auth).
-# Can also be set via JARVIS_AUTH_TOKEN env var.
+# If unset and bound to loopback (the default), the app is reachable only from
+# this machine; cross-site browser requests are still blocked by an Origin check.
+# If unset and bound to a non-loopback host (e.g. 0.0.0.0), the daemon
+# auto-generates a token at startup and prints it to the logs.
+# Set an explicit token here (or via JARVIS_AUTH_TOKEN) to choose your own.
 # auth:
 #   token: "your-secret-token-here"
 

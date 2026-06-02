@@ -178,6 +178,18 @@ export type JarvisConfig = {
   onboarding?: OnboardingConfig;
   daemon: {
     port: number;
+    /**
+     * Network interface the daemon's HTTP/WebSocket server binds to.
+     *
+     * Defaults to `127.0.0.1` (loopback only) so a fresh install is NOT
+     * reachable from other machines. Set to `0.0.0.0` to expose it on the
+     * network (the Docker image does this, since the container is isolated and
+     * the operator controls exposure via `-p`). Binding a non-loopback host
+     * with no `auth.token` causes the daemon to auto-generate one at startup.
+     *
+     * Precedence: `JARVIS_HOST` env var > this field > `127.0.0.1`.
+     */
+    host?: string;
     data_dir: string;
     db_path: string;
     /**
@@ -344,7 +356,21 @@ export const DEFAULT_CONFIG: JarvisConfig = {
   },
   authority: {
     default_level: 3,
-    governed_categories: ['send_email', 'send_message', 'make_payment'],
+    // Secure default: every destructive / externally-visible category requires
+    // explicit approval even when the agent's authority level is high enough to
+    // perform it. Without this, a level-5+ role (e.g. the default
+    // personal-assistant) silently runs shell commands. Users can narrow this
+    // set in config once they trust a given automation.
+    governed_categories: [
+      'send_email',
+      'send_message',
+      'make_payment',
+      'execute_command',
+      'install_software',
+      'delete_data',
+      'modify_settings',
+      'terminate_agent',
+    ],
     overrides: [],
     context_rules: [],
     learning: {

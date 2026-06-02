@@ -89,6 +89,7 @@ export class WebSocketServer {
   private clients: Set<ServerWebSocket<unknown>> = new Set();
   private handler: WSClientHandler | null = null;
   private port: number;
+  private hostname: string;
   private startTime: number = 0;
   private apiRoutes: Map<string, MethodRoutes> = new Map();
   private staticDir: string | null = null;
@@ -98,8 +99,9 @@ export class WebSocketServer {
   private corsOrigin: string | null = null;
   private proxyLimiter = new ProxyRateLimiter();
 
-  constructor(port: number = 3142) {
+  constructor(port: number = 3142, hostname: string = '127.0.0.1') {
     this.port = port;
+    this.hostname = hostname;
     this.corsOrigin = `http://localhost:${port}`;
   }
 
@@ -157,6 +159,7 @@ export class WebSocketServer {
 
     this.server = Bun.serve<{ sidecar_id?: string; proxy_target?: string; _proxyUpstream?: WebSocket }>({
       port: this.port,
+      hostname: this.hostname, // default 127.0.0.1 (loopback only); set to 0.0.0.0 to expose on the network
       idleTimeout: 30, // seconds — prevent timeout during heavy processing (OCR, PowerShell)
 
       async fetch(req, server) {
@@ -289,6 +292,33 @@ export class WebSocketServer {
                 'Access-Control-Allow-Headers': 'Content-Type',
               },
             });
+          }
+
+          // CSRF / cross-origin defense for state-changing requests.
+          // Browsers attach an Origin header to cross-origin POST/PUT/PATCH/
+          // DELETE — including fetch-issued "simple" requests that skip the
+          // CORS preflight (e.g. Content-Type: text/plain carrying a JSON
+          // body). Rejecting a mismatched Origin stops a malicious web page
+          // from blind-driving the local daemon even when no auth token is
+          // set. Requests with no Origin (curl, native/server-to-server
+          // clients) are unaffected; public routes (webhooks, jwks) are exempt
+          // because external callers legitimately POST cross-origin.
+          if (req.method !== 'GET' && req.method !== 'HEAD' && !isPublicRoute(pathname, req.method)) {
+            const origin = req.headers.get('origin');
+            if (origin) {
+              const expectedOrigin = self.corsOrigin || `http://localhost:${self.port}`;
+              let sameHost = false;
+              try {
+                const originHost = new URL(origin).host;
+                const requestHost = req.headers.get('host');
+                sameHost = !!requestHost && originHost === requestHost;
+              } catch {
+                sameHost = false;
+              }
+              if (origin !== expectedOrigin && !sameHost) {
+                return Response.json({ error: 'Forbidden: origin mismatch' }, { status: 403 });
+              }
+            }
           }
 
           // Try exact match first

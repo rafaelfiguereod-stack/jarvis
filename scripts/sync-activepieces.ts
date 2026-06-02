@@ -61,8 +61,10 @@ const VENDOR_PATHS: string[] = [
   "packages/pieces/community/openai",
   "packages/pieces/community/slack",
   "packages/pieces/community/telegram-bot",
-  // React UI for the visual builder (Vite app) + locale assets
-  "packages/web",
+  // Locale assets only. Upstream's `packages/web` (the Activepieces React/Vite
+  // app) is intentionally NOT vendored: Jarvis ships its own workflow builder
+  // under ui/src/v2/rooms/workflows and never imports the upstream frontend.
+  // Do not re-add "packages/web" here without also wiring it into a build.
   "packages/react-ui",
 ];
 
@@ -232,7 +234,6 @@ const BUMP_DEPS: Record<string, Record<string, string>> = {
   "packages/pieces/framework/package.json": { vitest: "4.1.0" },
   "packages/server/engine/package.json": { vitest: "4.1.0" },
   "packages/shared/package.json": { vitest: "4.1.0" },
-  "packages/web/package.json": { axios: "1.16.1", qs: "6.15.2", "i18next-http-backend": "3.0.5" },
 };
 
 /**

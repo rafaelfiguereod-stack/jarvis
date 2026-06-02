@@ -72,8 +72,8 @@ Additional pieces can be added later by editing `VENDOR_PATHS` in `scripts/sync-
 - `packages/pieces/common` -- shared piece utilities.
 - `packages/pieces/core/<curated>` -- built-in primitives (see list above).
 - community pieces are NOT vendored -- they install at runtime; see `src/workflows/pieces-library/README.md`.
-- `packages/web` -- the Vite-based visual builder app (formerly `packages/react-ui` before 0.82).
-- `packages/react-ui` -- locale assets the web app references at runtime.
+- `packages/web` -- the upstream Vite visual-builder app -- is intentionally NOT vendored. Jarvis ships its own workflow builder under `ui/src/v2/rooms/workflows` and never imports the upstream frontend, so the ~860-file app was dropped (it only added Dependabot surface). Do not re-add it without wiring it into a build.
+- `packages/react-ui` -- upstream locale (i18n) JSON assets. Retained for reference; not currently consumed now that `packages/web` (its only reader) is gone.
 
 `LICENSE.activepieces` (a copy of upstream's MIT LICENSE) sits next to this file.
 

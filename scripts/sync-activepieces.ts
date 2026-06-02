@@ -209,6 +209,33 @@ const SCRUB_DEPS: Record<string, string[]> = {
 };
 
 /**
+ * Security version pins for vendored `package.json` files post-copy. Upstream
+ * pins several deps to versions with known advisories (e.g. axios 1.15.0,
+ * vitest 3.0.8); we rewrite them to the first patched version so GitHub
+ * Dependabot stops flagging the vendored subtree. Only keys that already exist
+ * (in `dependencies` or `devDependencies`) are rewritten -- we never add a dep.
+ *
+ * NOTE: these packages are NOT installed by Jarvis -- the vendored tree has no
+ * lockfile and the root package.json declares no workspace -- so the pins are
+ * about clearing static advisories and protecting anyone who later installs a
+ * vendored piece directly. They do not change the Jarvis runtime, which
+ * resolves shared deps (axios, ...) from the root package.json + its overrides.
+ *
+ * Revisit on each sync: drop an entry once upstream's pin is already >= the
+ * patched version (the loop below fails loudly if a target dep disappears).
+ */
+const BUMP_DEPS: Record<string, Record<string, string>> = {
+  "packages/pieces/common/package.json": { axios: "1.16.1" },
+  "packages/pieces/core/http/package.json": { axios: "1.16.1", vitest: "4.1.0" },
+  "packages/pieces/core/file-helper/package.json": { vitest: "4.1.0" },
+  "packages/pieces/core/webhook/package.json": { vitest: "4.1.0" },
+  "packages/pieces/framework/package.json": { vitest: "4.1.0" },
+  "packages/server/engine/package.json": { vitest: "4.1.0" },
+  "packages/shared/package.json": { vitest: "4.1.0" },
+  "packages/web/package.json": { axios: "1.16.1", qs: "6.15.2", "i18next-http-backend": "3.0.5" },
+};
+
+/**
  * Strip dangling `export * from '<path>'` lines from barrel files where the
  * referenced path was filtered out by the EE / test-dir filters above. Without
  * this pass the engine bundle build fails to resolve the missing modules.
@@ -493,6 +520,35 @@ for (const [relPath, depNames] of Object.entries(SCRUB_DEPS)) {
   }
   writeFileSync(dst, JSON.stringify(pkg, null, 2) + "\n");
   info(`scrubbed ${removed} dep(s) from ${relPath}: [${depNames.join(", ")}]`);
+}
+for (const [relPath, pins] of Object.entries(BUMP_DEPS)) {
+  const dst = join(VENDOR_DIR, relPath);
+  if (!existsSync(dst)) {
+    fail(`bump target missing: ${relPath}`);
+  }
+  const pkg = JSON.parse(readFileSync(dst, "utf8")) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  let bumped = 0;
+  for (const [dep, version] of Object.entries(pins)) {
+    let found = false;
+    for (const field of ["dependencies", "devDependencies"] as const) {
+      const deps = pkg[field];
+      if (deps && dep in deps) {
+        found = true;
+        if (deps[dep] !== version) {
+          deps[dep] = version;
+          bumped++;
+        }
+      }
+    }
+    if (!found) {
+      fail(`bump target ${relPath} has no dependency "${dep}" -- did upstream rename or drop it? Update BUMP_DEPS.`);
+    }
+  }
+  writeFileSync(dst, JSON.stringify(pkg, null, 2) + "\n");
+  info(`bumped ${bumped} dep(s) in ${relPath}`);
 }
 for (const [relPath, patterns] of Object.entries(STRIP_EXPORT_LINES)) {
   const dst = join(VENDOR_DIR, relPath);

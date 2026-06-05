@@ -1,6 +1,6 @@
 import { test, expect, describe } from 'bun:test';
-import { mergeSTTConfig, mergeTTSConfig } from './config-merge.ts';
-import type { STTConfig, TTSConfig } from '../config/types.ts';
+import { mergeSTTConfig, mergeTTSConfig, mergeVoiceConfig, validateVoicePatch } from './config-merge.ts';
+import type { STTConfig, TTSConfig, VoiceConfig } from '../config/types.ts';
 
 describe('mergeSTTConfig', () => {
   test('preserves a different provider key when patching only one provider', () => {
@@ -134,5 +134,114 @@ describe('mergeTTSConfig', () => {
     expect(merged.enabled).toBe(true);
     expect(merged.provider).toBe('edge');
     expect(merged.voice).toBe('en-US-AriaNeural');
+  });
+});
+
+describe('mergeVoiceConfig', () => {
+  test('preserves realtime api_key when patch omits it', () => {
+    const existing: VoiceConfig = {
+      wake_engine: 'openwakeword',
+      realtime: { enabled: true, api_key: 'sk-secret', model: 'gpt-realtime-2', reasoning_effort: 'low' },
+    };
+    const merged = mergeVoiceConfig(existing, { realtime: { reasoning_effort: 'high' } });
+    expect(merged.realtime?.api_key).toBe('sk-secret');     // preserved
+    expect(merged.realtime?.reasoning_effort).toBe('high');  // updated
+    expect(merged.realtime?.model).toBe('gpt-realtime-2');   // sibling intact
+  });
+
+  test('empty api_key string does not wipe the stored key', () => {
+    const existing: VoiceConfig = {
+      wake_engine: 'openwakeword',
+      realtime: { enabled: true, api_key: 'sk-secret' },
+    };
+    const merged = mergeVoiceConfig(existing, { realtime: { enabled: false, api_key: '' } });
+    expect(merged.realtime?.api_key).toBe('sk-secret');
+    expect(merged.realtime?.enabled).toBe(false);
+  });
+
+  test('accepts a new api_key when provided', () => {
+    const existing: VoiceConfig = { wake_engine: 'openwakeword', realtime: { enabled: false, api_key: 'old' } };
+    const merged = mergeVoiceConfig(existing, { realtime: { enabled: true, api_key: 'new' } });
+    expect(merged.realtime?.api_key).toBe('new');
+  });
+
+  test('shallow-merges wake_engine without touching realtime', () => {
+    const existing: VoiceConfig = { wake_engine: 'openwakeword', realtime: { enabled: true, api_key: 'k' } };
+    const merged = mergeVoiceConfig(existing, { wake_engine: 'webspeech' });
+    expect(merged.wake_engine).toBe('webspeech');
+    expect(merged.realtime?.enabled).toBe(true);
+  });
+
+  test('initializes from undefined', () => {
+    const merged = mergeVoiceConfig(undefined, { realtime: { enabled: true, api_key: 'k', voice: 'marin' } });
+    expect(merged.wake_engine).toBe('openwakeword');
+    expect(merged.realtime?.voice).toBe('marin');
+  });
+});
+
+describe('validateVoicePatch', () => {
+  test('accepts a well-formed patch', () => {
+    const res = validateVoicePatch({
+      wake_engine: 'webspeech',
+      realtime: {
+        enabled: true,
+        reasoning_effort: 'high',
+        max_session_minutes: 30,
+        monthly_budget_usd: 25,
+        blocked_categories: ['make_payment'],
+      },
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  test('accepts null monthly_budget_usd (UI "no cap")', () => {
+    expect(validateVoicePatch({ realtime: { monthly_budget_usd: null } }).ok).toBe(true);
+  });
+
+  test('rejects non-object bodies', () => {
+    expect(validateVoicePatch(null).ok).toBe(false);
+    expect(validateVoicePatch([]).ok).toBe(false);
+    expect(validateVoicePatch('nope').ok).toBe(false);
+  });
+
+  test('rejects unknown top-level fields', () => {
+    const res = validateVoicePatch({ haxx: 1 });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('Unknown');
+  });
+
+  test('rejects an invalid wake_engine', () => {
+    expect(validateVoicePatch({ wake_engine: 'bogus' }).ok).toBe(false);
+  });
+
+  test('rejects an invalid reasoning_effort', () => {
+    expect(validateVoicePatch({ realtime: { reasoning_effort: 'ludicrous' } }).ok).toBe(false);
+  });
+
+  test('rejects out-of-range or non-numeric max_session_minutes', () => {
+    expect(validateVoicePatch({ realtime: { max_session_minutes: -1 } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: { max_session_minutes: 0 } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: { max_session_minutes: 99999 } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: { max_session_minutes: 'ten' } }).ok).toBe(false);
+  });
+
+  test('rejects a negative budget and non-array blocked_categories', () => {
+    expect(validateVoicePatch({ realtime: { monthly_budget_usd: -5 } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: { blocked_categories: 'notanarray' } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: { blocked_categories: [1, 2] } }).ok).toBe(false);
+  });
+
+  test('rejects unknown action categories but accepts known ones', () => {
+    expect(validateVoicePatch({ realtime: { blocked_categories: ['make_payment', 'delete_data'] } }).ok).toBe(true);
+    const res = validateVoicePatch({ realtime: { blocked_categories: ['make_payment', 'file_delete'] } });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('file_delete');
+    // An explicit empty array (disable the backstop) is still allowed.
+    expect(validateVoicePatch({ realtime: { blocked_categories: [] } }).ok).toBe(true);
+  });
+
+  test('rejects wrong-typed enabled / realtime', () => {
+    expect(validateVoicePatch({ realtime: { enabled: 'yes' } }).ok).toBe(false);
+    expect(validateVoicePatch({ realtime: 'nope' }).ok).toBe(false);
   });
 });

@@ -91,8 +91,14 @@ export type VoiceCallbacks = {
   onTTSStart: (requestId: string, containsWake: boolean) => void;
   /** Mid-turn flip: a later sentence in the same turn contains "Jarvis". */
   onTTSContainsWake?: () => void;
-  onTTSEnd: () => void;
+  /** `bargeIn` — realtime voice sends tts_end{bargeIn:true} when the user
+   *  starts speaking, so the player can flush queued output immediately. */
+  onTTSEnd: (bargeIn?: boolean) => void;
   onError: (message?: string) => void;
+  /** Realtime session ended server-side (max_session_minutes timeout or
+   *  server close). The client must stop the mic — it's otherwise streaming
+   *  into a session that no longer exists. */
+  onRealtimeClosed?: () => void;
 };
 
 export type WorkflowEvent = {
@@ -486,7 +492,44 @@ export function useWebSocket() {
           return;
         }
         if (msg.type === "tts_end") {
-          voiceCallbacksRef.current?.onTTSEnd();
+          voiceCallbacksRef.current?.onTTSEnd(Boolean(msg.payload?.bargeIn));
+          return;
+        }
+        // Premium realtime voice (gpt-realtime-2) status + live captions.
+        if (msg.type === "realtime_status") {
+          const state = msg.payload?.state;
+          // Surface any human-readable reason (e.g. budget reached) as a
+          // persistent system line — the v2 orb collapses error→idle and shows
+          // no text, so without this the message would be invisible.
+          if (msg.payload?.message) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "system" as MessageRole,
+                content: msg.payload.message,
+                timestamp: msg.timestamp,
+              },
+            ]);
+          }
+          if (state === "error") voiceCallbacksRef.current?.onError(msg.payload?.message);
+          // Server tore the session down (timeout/close) — stop the hot mic.
+          else if (state === "closed") voiceCallbacksRef.current?.onRealtimeClosed?.();
+          return;
+        }
+        if (msg.type === "realtime_transcript") {
+          // Only surface completed utterances as chat messages.
+          if (msg.payload?.final && msg.payload?.text) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: (msg.payload.role === "assistant" ? "assistant" : "user") as MessageRole,
+                content: msg.payload.text,
+                timestamp: msg.timestamp,
+              },
+            ]);
+          }
           return;
         }
         if (msg.type === "thinking_start") {

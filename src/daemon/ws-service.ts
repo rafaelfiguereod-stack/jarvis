@@ -6,6 +6,8 @@
  */
 
 import type { ServerWebSocket } from 'bun';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { Service, ServiceStatus } from './services.ts';
 import type { AgentService } from './agent-service.ts';
 import type { CommitmentExecutor } from './commitment-executor.ts';
@@ -36,6 +38,11 @@ import { createCommitment, updateCommitmentStatus, updateCommitmentAssignee } fr
 import { recordAgentActivity } from '../vault/agent-activity.ts';
 import { WebSocketServer, type WSMessage } from '../comms/websocket.ts';
 import { StreamRelay } from '../comms/streaming.ts';
+import { resolveRealtimeVoice, type ResolvedRealtimeVoice } from '../config/realtime.ts';
+import { BrowserAudioTransport } from '../comms/audio-transport.ts';
+import { RealtimeVoiceSession } from './realtime-voice.ts';
+import { REALTIME_NAV_TOOLS, REALTIME_NAV_TOOL_NAMES } from './realtime-nav-tools.ts';
+import { RealtimeBudgetTracker } from './realtime-budget.ts';
 import { classifyErrorString } from '../llm/provider.ts';
 import { getOrCreateConversation, addMessage } from '../vault/conversations.ts';
 import { maybeCreateUserProfileFollowupPrompt, recordUserProfileTurn } from '../user/profile-followup.ts';
@@ -143,6 +150,22 @@ export class WebSocketService implements Service {
   private sttProvider: STTProvider | null = null;
   private voiceSessions = new Map<ServerWebSocket<unknown>, VoiceSession>();
   private pendingVoiceConfirmations = new Map<string, PendingVoiceConfirmation>();
+  /**
+   * Premium realtime voice (gpt-realtime-2) sessions, keyed by socket. Present
+   * only when `voice.realtime.enabled` resolves with a key. A realtime session
+   * owns the full duplex audio loop (STT+LLM+TTS in one OpenAI connection), so
+   * the socket's normal `voiceSessions` accumulator is bypassed while it lives.
+   */
+  private realtimeSessions = new Map<
+    ServerWebSocket<unknown>,
+    { session: RealtimeVoiceSession; transport: BrowserAudioTransport; timeout: ReturnType<typeof setTimeout>; startedAt: number }
+  >();
+  /**
+   * Lazily-created monthly spend guard for realtime voice. Only used when a
+   * `monthly_budget_usd` is configured; persists to the daemon data dir so the
+   * cap survives restarts. See realtime-budget.ts.
+   */
+  private realtimeBudget: RealtimeBudgetTracker | null = null;
   /**
    * Phase B — per-WS onboarding interview sessions. Created on
    * `interview_start`, torn down on disconnect or after the agent
@@ -297,6 +320,8 @@ export class WebSocketService implements Service {
           console.log('[WSService] Client connected');
         },
         onDisconnect: (ws) => {
+          // Tear down any realtime voice session (closes the OpenAI WS + timer).
+          this.closeRealtimeVoice(ws);
           // Clean up every per-socket map so a long-running daemon doesn't
           // accumulate dead-socket entries across reconnects. See
           // cleanupPerSocketMaps for the contract; tested in
@@ -715,6 +740,9 @@ export class WebSocketService implements Service {
 
       case 'voice_start': {
         const { requestId, currentRoom } = msg.payload as { requestId: string; currentRoom?: string };
+        // Premium path: if realtime voice is enabled + keyed, open (or reuse) a
+        // full-duplex realtime session and skip the STT accumulator entirely.
+        if (this.tryStartRealtimeVoice(ws)) return undefined;
         this.voiceSessions.set(ws, {
           requestId,
           chunks: [],
@@ -1148,12 +1176,189 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
    * Accumulates chunks into the active voice session for this client.
    */
   private async handleVoiceAudio(data: Buffer, ws: ServerWebSocket<unknown>): Promise<void> {
+    // Realtime path: stream the mic frame straight into the OpenAI session.
+    const realtime = this.realtimeSessions.get(ws);
+    if (realtime) {
+      realtime.transport.pushMicChunk(data);
+      return;
+    }
     const session = this.voiceSessions.get(ws);
     if (!session) {
       console.warn('[WSService] Binary audio received with no active voice session');
       return;
     }
     session.chunks.push(data);
+  }
+
+  /**
+   * Open (or reuse) a premium realtime voice session for this socket. Returns
+   * true if realtime handled the `voice_start` (so the caller skips the normal
+   * STT accumulator), false if realtime is disabled/unavailable.
+   *
+   * A single session spans the conversation: `voice_end` is a no-op for
+   * realtime (OpenAI's semantic VAD detects turns), and the session is closed
+   * on disconnect or after `max_session_minutes` (cost guard).
+   */
+  private tryStartRealtimeVoice(ws: ServerWebSocket<unknown>): boolean {
+    if (this.realtimeSessions.has(ws)) return true; // already streaming
+
+    let resolved: ResolvedRealtimeVoice;
+    try {
+      const res = resolveRealtimeVoice(this.agentService.getConfig());
+      if (!res.ok) return false;
+      resolved = res.resolved;
+    } catch (err) {
+      console.warn('[WSService] realtime voice resolve failed, using standard pipeline:', err);
+      return false;
+    }
+
+    // Monthly spend guard: refuse new sessions once the estimated budget is
+    // hit. Returns true (caller skips the standard accumulator) but opens no
+    // session. Sent as `closed` (not `error`) + a message so the client stops
+    // the mic via the normal close path and surfaces the reason, rather than a
+    // bare error flash. Falling through to the standard pipeline would be wrong:
+    // the client is already streaming raw realtime PCM, which the WAV-based path
+    // can't consume.
+    if (resolved.monthlyBudgetUsd && !this.getRealtimeBudget().canStart(resolved.monthlyBudgetUsd)) {
+      console.warn('[WSService] realtime monthly budget reached — refusing new session');
+      this.wsServer.sendToClient(ws, {
+        type: 'realtime_status',
+        payload: {
+          state: 'closed',
+          reason: 'budget',
+          message: `Monthly realtime voice budget ($${resolved.monthlyBudgetUsd}) reached. Voice is paused until next month or until you raise the limit in Settings > Voice.`,
+        },
+        timestamp: Date.now(),
+      });
+      return true;
+    }
+
+    const orchestrator = this.agentService.getOrchestrator();
+    const transport = new BrowserAudioTransport({
+      sendAudio: (chunk) => this.wsServer.sendBinary(ws, chunk),
+      signalStopPlayback: () =>
+        this.wsServer.sendToClient(ws, { type: 'tts_end', payload: { bargeIn: true }, timestamp: Date.now() }),
+      // OpenAI requires input rate >= 24kHz; the browser client must capture/
+      // resample to this. Output is also 24kHz PCM.
+      inputSampleRate: 24000,
+      outputSampleRate: 24000,
+    });
+
+    const session = new RealtimeVoiceSession(resolved, transport, {
+      // Agent tools + dashboard navigation/in-room-action tools so the model
+      // can drive the UI by voice (open settings, turn off TTS, go back…).
+      tools: [...orchestrator.getRealtimeTools(), ...REALTIME_NAV_TOOLS],
+      // Lean voice prompt (~100 tokens) instead of the full ~5.6k-token agent
+      // prompt — the big context was the dominant per-turn latency for simple
+      // questions. Tools stay, so capability is unchanged. See agent-service.
+      instructions: this.agentService.buildRealtimeVoiceInstructions(),
+      executeToolCall: (name, args) => {
+        // Dashboard nav/in-room actions are handled here (they broadcast to the
+        // dashboard); everything else goes through the auto-approve tool bridge.
+        const nav = this.executeRealtimeNavTool(name, args);
+        if (nav !== null) return Promise.resolve(nav);
+        return orchestrator.executeRealtimeToolCall(name, args, { blockedCategories: resolved.blockedCategories });
+      },
+      onTranscript: (t) =>
+        this.wsServer.sendToClient(ws, {
+          type: 'realtime_transcript',
+          payload: { role: t.role, text: t.text, final: t.final },
+          timestamp: Date.now(),
+        }),
+      onError: (err) => {
+        console.error('[WSService] realtime voice error:', err);
+        this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'error', message: err }, timestamp: Date.now() });
+      },
+      onClose: () => this.closeRealtimeVoice(ws),
+    });
+
+    const timeout = setTimeout(() => {
+      console.log('[WSService] realtime session hit max_session_minutes, closing');
+      this.closeRealtimeVoice(ws);
+    }, resolved.maxSessionMinutes * 60_000);
+
+    this.realtimeSessions.set(ws, { session, transport, timeout, startedAt: Date.now() });
+    session.connect().then(
+      () => this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'live', model: resolved.model }, timestamp: Date.now() }),
+      (err) => {
+        console.error('[WSService] realtime connect failed:', err);
+        this.closeRealtimeVoice(ws);
+      },
+    );
+    return true;
+  }
+
+  /**
+   * Execute a dashboard navigation / in-room-action tool called by the realtime
+   * voice model. Returns a short result string for the model to acknowledge, or
+   * null if `name` isn't a navigation tool (so the caller falls through to the
+   * normal tool bridge). Reuses the same broadcast* methods the standard voice
+   * path uses, so the dashboard reacts identically.
+   */
+  private executeRealtimeNavTool(name: string, args: Record<string, unknown>): string | null {
+    if (!REALTIME_NAV_TOOL_NAMES.has(name)) return null;
+    const reqId = crypto.randomUUID();
+    switch (name) {
+      case 'open_dashboard_room': {
+        const room = String(args.room ?? '');
+        if (!room) return 'No room specified.';
+        this.broadcastRoomNavigation(room as RoomKey, reqId);
+        return `Opened the ${room} room.`;
+      }
+      case 'go_back_to_thread': {
+        this.broadcastNavigateHome(reqId);
+        return 'Back to the thread.';
+      }
+      case 'control_dashboard_window': {
+        const action = String(args.action ?? '');
+        const target = (args.target ? String(args.target) : 'most_recent') as RoomKey | 'most_recent';
+        if (!action) return 'No window action specified.';
+        this.broadcastWindowControl({ action: action as WindowControl['action'], target }, reqId);
+        return `${action} done.`;
+      }
+      case 'dashboard_room_action': {
+        const room = String(args.room ?? '');
+        const action = String(args.action ?? '');
+        if (!room || !action) return 'Room and action are required.';
+        const innerArgs = (args.args && typeof args.args === 'object') ? args.args as Record<string, unknown> : {};
+        // Auto-open the room first (no-op if already open), then dispatch —
+        // mirrors the classifier path so the qualifier isn't dropped.
+        this.broadcastRoomNavigation(room as RoomKey, reqId);
+        this.broadcastRoomAction({ room, action, args: innerArgs }, reqId);
+        return `Done: ${action} in ${room}.`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** Lazily build the monthly spend tracker, persisted under the data dir. */
+  private getRealtimeBudget(): RealtimeBudgetTracker {
+    if (!this.realtimeBudget) {
+      const dataDir = this.agentService.getConfig().daemon?.data_dir || join(homedir(), '.jarvis');
+      this.realtimeBudget = RealtimeBudgetTracker.fromFile(join(dataDir, 'realtime-budget.json'));
+    }
+    return this.realtimeBudget;
+  }
+
+  /** Tear down a realtime voice session and notify the client. */
+  private closeRealtimeVoice(ws: ServerWebSocket<unknown>): void {
+    const entry = this.realtimeSessions.get(ws);
+    if (!entry) return;
+    this.realtimeSessions.delete(ws);
+    clearTimeout(entry.timeout);
+    // Record estimated spend against the monthly budget (only meaningful when a
+    // budget is set; recording always is cheap and keeps the cap honest if one
+    // is added mid-month).
+    try {
+      this.getRealtimeBudget().recordSessionSeconds((Date.now() - entry.startedAt) / 1000);
+    } catch (err) {
+      console.warn('[WSService] failed to record realtime spend:', err);
+    }
+    try { entry.session.close(); } catch { /* ignore */ }
+    try {
+      this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'closed' }, timestamp: Date.now() });
+    } catch { /* socket may already be gone */ }
   }
 
   /**

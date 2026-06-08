@@ -126,24 +126,35 @@ export class StreamRelay {
       }
 
       if (streamError) {
-        throw new Error(streamError);
+        // Error event was already broadcast above. Throw a marked Error so
+        // the caller's catch path can SKIP sending another error message
+        // (otherwise the user sees the same error twice - once from broadcast,
+        // once from the handler's catch-block reply).
+        const err = new Error(streamError) as Error & { _streamErrorBroadcast?: boolean };
+        err._streamErrorBroadcast = true;
+        throw err;
       }
     } catch (error) {
       console.error('[StreamRelay] Error relaying stream:', error);
 
-      const message = error instanceof Error ? error.message : 'Stream relay error';
-      const errorMessage: WSMessage = {
-        type: 'error',
-        payload: {
-          message,
-          code: classifyErrorString(message),
-          requestId,
-        },
-        id: requestId,
-        timestamp: Date.now(),
-      };
-
-      this.wsServer.broadcast(errorMessage);
+      // Only broadcast here if we DIDN'T already broadcast inside the loop.
+      // streamError being null means the exception came from somewhere else
+      // (e.g., a synchronous throw inside the for-await), so the client
+      // hasn't seen anything yet.
+      if (!streamError) {
+        const message = error instanceof Error ? error.message : 'Stream relay error';
+        const errorMessage: WSMessage = {
+          type: 'error',
+          payload: {
+            message,
+            code: classifyErrorString(message),
+            requestId,
+          },
+          id: requestId,
+          timestamp: Date.now(),
+        };
+        this.wsServer.broadcast(errorMessage);
+      }
 
       throw error;
     }

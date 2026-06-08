@@ -1364,6 +1364,102 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // --- Usage telemetry ---
+    /**
+     * Filterable LLM usage query. All query params are optional:
+     *   from, to        unix-ms range bounds (default: last 30 days -> now)
+     *   tier            CSV: conversation,high,medium,low
+     *   model           CSV
+     *   subsystem       CSV
+     *   provider        CSV
+     *   errors_only     "true" | "false" | "" (both)
+     *   group_by        tier | model | subsystem | provider | date | none
+     *                   default: model
+     */
+    '/api/usage': {
+      GET: async (req: Request) => {
+        try {
+          const { queryUsage } = await import('../llm/usage.ts');
+          const url = new URL(req.url);
+          const get = (k: string) => url.searchParams.get(k);
+
+          const parseCsv = (v: string | null): string[] | undefined => {
+            if (!v) return undefined;
+            const list = v.split(',').map((s) => s.trim()).filter(Boolean);
+            return list.length > 0 ? list : undefined;
+          };
+          const parseInt64 = (v: string | null): number | undefined => {
+            if (!v) return undefined;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : undefined;
+          };
+          const errorsOnlyRaw = get('errors_only');
+          const errorsOnly = errorsOnlyRaw === 'true' ? true : errorsOnlyRaw === 'false' ? false : undefined;
+          const groupByRaw = get('group_by') ?? 'model';
+          const validGroups = ['tier', 'model', 'subsystem', 'provider', 'date', 'none'] as const;
+          const groupBy = (validGroups as readonly string[]).includes(groupByRaw)
+            ? (groupByRaw as typeof validGroups[number])
+            : 'model';
+
+          const result = queryUsage(
+            {
+              fromMs: parseInt64(get('from')),
+              toMs: parseInt64(get('to')),
+              tiers: parseCsv(get('tier')),
+              models: parseCsv(get('model')),
+              subsystems: parseCsv(get('subsystem')),
+              providers: parseCsv(get('provider')),
+              errorsOnly,
+            },
+            groupBy,
+          );
+          return json(result);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, rows: [], total: { calls: 0, input_tokens: 0, output_tokens: 0, total_latency_ms: 0, errors: 0 } });
+        }
+      },
+    },
+
+    /** Distinct filter values + date range present in the DB. Used by the
+     *  Usage room to populate filter dropdowns with only-extant choices. */
+    '/api/usage/filters': {
+      GET: async () => {
+        try {
+          const { listUsageDistinctValues } = await import('../llm/usage.ts');
+          return json(listUsageDistinctValues());
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, tiers: [], models: [], subsystems: [], providers: [], earliest_ts: null, latest_ts: null });
+        }
+      },
+    },
+
+    /**
+     * Paused conv-tier tasks (status === 'needs_input'). Used by the dashboard
+     * to surface pending questions after a daemon restart - durability lands
+     * them back in the registry on boot, this endpoint makes them visible to
+     * the user. The conv LLM separately picks them up via registry context.
+     * Returns an empty list when running in classic mode (no task registry).
+     */
+    '/api/tasks/paused': {
+      GET: () => {
+        const registry = ctx.agentService.getTaskRegistry();
+        if (!registry) return json({ tasks: [] });
+        const tasks = registry.inFlight()
+          .filter((t) => t.status === 'needs_input')
+          .map((t) => ({
+            id: t.id,
+            template: t.request.template,
+            intent: t.request.intent,
+            question: t.question ?? '',
+            started_at: t.startedAt,
+            updated_at: t.updatedAt,
+          }));
+        return json({ tasks });
+      },
+    },
+
     // --- Roles ---
     '/api/roles': {
       GET: () => {
@@ -1915,7 +2011,6 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           wake_engine: voice?.wake_engine ?? 'openwakeword',
           realtime: {
             enabled: rt?.enabled ?? false,
-            has_api_key: !!rt?.api_key,
             model: rt?.model ?? 'gpt-realtime-2',
             voice: rt?.voice ?? null,
             reasoning_effort: rt?.reasoning_effort ?? 'low',
@@ -1929,7 +2024,9 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             // it is so a client can tell "using the default" from an explicit set.
             blocked_categories: rt?.blocked_categories ?? DEFAULT_BLOCKED_CATEGORIES,
             blocked_categories_default: rt?.blocked_categories === undefined,
-            // true when enabled AND a key resolves (own key, llm.openai, or env).
+            // true when enabled AND an OpenAI provider key resolves (via
+            // llm.providers or env) - reflects whether realtime would actually
+            // start if voice_start arrived right now.
             available,
           },
         });

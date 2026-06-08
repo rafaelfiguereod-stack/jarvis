@@ -698,6 +698,36 @@ export class WebSocketService implements Service {
   }
 
   /**
+   * Broadcast a conv-tier task lifecycle event to all connected clients. The
+   * UI uses these to render status pills like `[research running - 14s]`
+   * while a delegated task is in flight, and to flash a "result ready" hint
+   * when the task completes after the user has moved on.
+   *
+   * Full payload contract + consumer example: see the `task_event` comment
+   * on `WSMessage` in `src/comms/websocket.ts`. Briefly:
+   *   - task_started: show/update a pill for this task_id
+   *   - task_completed/failed/cancelled: remove the pill, show summary
+   *   - task_started CAN fire again on the same task_id when a paused task
+   *     resumes (after the conv LLM provided a clarification reply)
+   */
+  broadcastTaskEvent(event: {
+    type: 'task_started' | 'task_completed' | 'task_failed' | 'task_cancelled';
+    task_id: string;
+    template: string;
+    intent: string;
+    status: string;
+    elapsedMs: number;
+    summary?: string;
+  }): void {
+    const message: WSMessage = {
+      type: 'task_event',
+      payload: event,
+      timestamp: Date.now(),
+    };
+    this.wsServer.broadcast(message);
+  }
+
+  /**
    * Format a FileEntry tree into a compact text listing.
    */
   private formatFileTree(entry: { name: string; path: string; type: 'file' | 'directory'; children?: { name: string; type: 'file' | 'directory' }[] }): string {
@@ -1158,6 +1188,14 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         }
       }
 
+      // If StreamRelay already broadcast the error to all clients (including
+      // this requester), don't emit a second error WSMessage as the handler
+      // return value - the user would see the same error twice.
+      const broadcastFlag = (error as Error & { _streamErrorBroadcast?: boolean })?._streamErrorBroadcast;
+      if (broadcastFlag) {
+        return undefined;
+      }
+
       const message = error instanceof Error ? error.message : 'Chat processing failed';
       return {
         type: 'error',
@@ -1396,7 +1434,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     }
 
     const llm = this.agentService.getLLMManager();
-    if (!llm.getProvider(this.agentService.getConfig().llm.primary)) {
+    // Just check that at least one provider is registered. The interviewer
+    // routes through llm.chatTier internally which resolves through the
+    // configured default/tiers.
+    if (llm.getProviderNames().length === 0) {
       this.wsServer.sendToClient(ws, {
         type: 'interview_error',
         payload: { message: 'No LLM configured. Finish setup first.' },
@@ -1539,7 +1580,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     const trimmed = text.trim();
     if (!trimmed) return false;
 
-    // Window-control fast path — same as voice. Catches "close",
+    // Window-control fast path — regex-only, ~zero latency. Catches "close",
     // "minimize tools", "reorder layout" etc. without an LLM call.
     const winCtrl = matchWindowControl(trimmed);
     if (winCtrl) {
@@ -1551,65 +1592,15 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       return true;
     }
 
-    // Classify. Failure is tolerable — fall through to the chat agent.
-    const llm = this.agentService.getLLMManager();
-    const recentTurns = this.recentTurns('websocket');
-    const userProfilePrompt = formatUserProfileForPrompt(getUserProfile());
-    const intent = await classifyVoiceIntent(trimmed, recentTurns, llm, currentRoom, userProfilePrompt);
-    const route = routeByConfidence(intent);
-
-    console.log(
-      `[WSService] Text intent: verb=${intent.verb} impact=${intent.impact} ` +
-      `confidence=${intent.confidence.toFixed(2)} → ${route}`,
-    );
-
-    // Only intercept when the classifier is confident enough to act
-    // AND the intent is a command. Anything else falls through to the
-    // chat agent — voice would prompt for confirmation here, but text
-    // users want an answer, not a clarifier.
-    if (route !== 'act') return false;
-
-    if (intentIsBackToThread(intent)) {
-      this.broadcastNavigateHome(requestId);
-      this.broadcastAssistantAck("Going back to the thread.", requestId);
-      return true;
-    }
-
-    // Workflow-creation requests are better handled by the chat agent
-    // through the `manage_workflow` tool: the LLM can iterate on the
-    // composer's validation errors, name the flow, follow up with
-    // publish, etc. The voice path keeps the room_action route because
-    // a voice user can't easily iterate on tool output. Text users get
-    // the full tool loop.
-    if (
-      intent.room_action?.action === 'create_from_nl' ||
-      (intent.verb === 'create' && intent.object?.type === 'workflow')
-    ) {
-      return false;
-    }
-
-    if (intent.room_action) {
-      const ra = intent.room_action;
-      // Auto-open the target room first so the body's `useRoomActions`
-      // handler is registered by the time the action dispatches. The
-      // UI bus also queues actions when no handler is mounted yet, so
-      // even without this navigation the action would fire on register
-      // — but firing nav explicitly gives the user immediate visual
-      // feedback that the room is opening.
-      const targetRoom = ra.room as RoomKey;
-      this.broadcastRoomNavigation(targetRoom, requestId);
-      this.broadcastRoomAction(ra, requestId);
-      this.broadcastAssistantAck(ackForRoomAction(ra), requestId);
-      return true;
-    }
-
-    const roomKey = intentToRoomKey(intent);
-    if (roomKey) {
-      this.broadcastRoomNavigation(roomKey, requestId);
-      this.broadcastAssistantAck(`Opening the ${roomKey} room.`, requestId);
-      return true;
-    }
-
+    // The LLM-based voice_intent classifier used to run here for typed text
+    // to catch "navigate to settings" / "open the goals room" before the
+    // chat agent saw the message. That added 5-10s of latency on a slow
+    // `low` tier (e.g. local ollama qwen3) - blocking ALL typed input on a
+    // classification step the user didn't ask for. In conv-tier mode the
+    // conv LLM owns this responsibility (it can navigate via its delegate
+    // tool). Voice still runs the full classifier in processVoiceTranscript
+    // because voice users can't easily click UI buttons. Regex window-control
+    // above still fires for typed text - that's the cheap fast-path.
     return false;
   }
 

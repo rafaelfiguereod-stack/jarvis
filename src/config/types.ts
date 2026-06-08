@@ -4,6 +4,16 @@ export type HeartbeatConfig = {
   aggressiveness: 'passive' | 'moderate' | 'aggressive';
 };
 
+/**
+ * System-level cron expressions. Published as `cron.<name>` events on the
+ * shared event bus so other subsystems can react instead of polling.
+ */
+export type SystemCronConfig = {
+  morning?: string;   // default "0 7 * * *"
+  evening?: string;   // default "0 20 * * *"
+  hourly?: string;    // default "37 * * * *"
+};
+
 export type GoogleConfig = {
   client_id: string;
   client_secret: string;
@@ -34,20 +44,16 @@ export type RealtimeReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'x
 
 /**
  * Premium opt-in speech-to-speech voice via OpenAI's Realtime API
- * (`gpt-realtime-2`). BYO OpenAI key — the user pays OpenAI directly. When
- * disabled (default) JARVIS uses the standard STT -> text LLM -> TTS pipeline.
+ * (`gpt-realtime-2`). When enabled, the realtime session reuses the OpenAI
+ * provider configured under `llm.providers` (matched by `kind: 'openai'`) -
+ * there is no separate realtime key. When disabled (default) JARVIS uses the
+ * standard STT -> text LLM -> TTS pipeline.
  *
  * See docs/GPT_REALTIME_2_INTEGRATION.md.
  */
 export type RealtimeVoiceConfig = {
   /** Master opt-in. Default false. Env: JARVIS_REALTIME_VOICE. */
   enabled: boolean;
-  /**
-   * OpenAI API key for the realtime session. If unset, resolution falls back to
-   * the existing `llm.openai.api_key`, then env. Never hard-fails the daemon —
-   * if no key resolves while enabled, JARVIS warns and uses the standard path.
-   */
-  api_key?: string;
   /** Realtime model id. Default 'gpt-realtime-2'. */
   model?: string;
   /** OpenAI realtime voice id (e.g. 'marin', 'cedar'). */
@@ -219,6 +225,108 @@ export type OnboardingConfig = {
   last_reset_at?: number;
 };
 
+/**
+ * LLM provider classes that the system knows how to instantiate. The `kind`
+ * field on a provider entry selects one of these; the canonical default is
+ * the provider's name (the key in `providers`).
+ */
+export type LLMProviderKind =
+  | 'anthropic'
+  | 'openai'
+  | 'groq'
+  | 'gemini'
+  | 'ollama'
+  | 'openrouter'
+  | 'nvidia'
+  | 'openai_compatible'
+  | 'litellm';
+
+/**
+ * Credentials + endpoint for one provider instance. The `kind` field is
+ * optional; when absent, the key in `LLMConfig.providers` is assumed to be
+ * the provider class (e.g. `anthropic`). Specify `kind` explicitly when you
+ * want multiple instances of the same class (e.g. two ollama backends with
+ * different keys/URLs).
+ */
+export type LLMProviderEntry = {
+  /** Which provider class to use. Defaults to the map key. */
+  kind?: LLMProviderKind;
+  /** API key for cloud providers. */
+  api_key?: string;
+  /** Base URL for self-hosted / local providers (ollama, openai-compatible, litellm). */
+  base_url?: string;
+};
+
+/**
+ * Model reference string in the form "<provider-name>:<model-id>" where
+ * `provider-name` is a key in `LLMConfig.providers`. Examples:
+ *   "anthropic:claude-sonnet-4-6"
+ *   "openai:gpt-4o-mini"
+ *   "ollama:llama3"
+ *   "ollama-remote:qwen2.5"   (custom-named provider instance)
+ */
+export type LLMModelRef = string;
+
+export type LLMTiersConfig = {
+  conversation?: LLMModelRef;
+  high?: LLMModelRef;
+  medium?: LLMModelRef;
+  low?: LLMModelRef;
+};
+
+export type LLMConfig = {
+  /**
+   * Provider credentials, keyed by the name you reference them as in model
+   * strings. Set `kind` when you want a custom name (e.g. two ollama
+   * instances "ollama-local" + "ollama-remote", both with kind=ollama).
+   */
+  providers?: Record<string, LLMProviderEntry>;
+
+  /**
+   * Single-LLM mode model reference. When set and `tiers` is absent, all
+   * task tiers (low/medium/high) resolve to this model and the classic
+   * orchestrator runs. Ignored when `tiers` is configured.
+   */
+  default?: LLMModelRef;
+
+  /**
+   * Per-tier model overrides. Presence of any tier here activates tier-aware
+   * routing. The `conversation` tier specifically switches the system into
+   * router-first mode (conv LLM delegates to task tiers); task tiers
+   * (low/medium/high) without an explicit assignment fall up.
+   */
+  tiers?: LLMTiersConfig;
+
+  /**
+   * Legacy single-block-per-provider shape kept for backward compatibility.
+   * The loader auto-migrates these into `providers` + `default` in-memory.
+   * New configs should use `providers` + `default` / `tiers` instead.
+   *
+   * @deprecated Use `providers` + `default`/`tiers` instead.
+   */
+  primary?: string;
+  /** @deprecated Tier fall-up replaces the fallback chain. */
+  fallback?: string[];
+  /** @deprecated Use `providers.anthropic` + a model reference. */
+  anthropic?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.openai` + a model reference. */
+  openai?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.groq` + a model reference. */
+  groq?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.gemini` + a model reference. */
+  gemini?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.ollama` + a model reference. */
+  ollama?: { base_url?: string; model?: string };
+  /** @deprecated Use `providers.openrouter` + a model reference. */
+  openrouter?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.nvidia` + a model reference. */
+  nvidia?: { api_key: string; model?: string };
+  /** @deprecated Use `providers.openai_compatible` + a model reference. */
+  openai_compatible?: { base_url?: string; api_key?: string; model?: string };
+  /** @deprecated Use `providers.litellm` + a model reference. */
+  litellm?: { base_url?: string; api_key?: string; model?: string };
+};
+
 export type JarvisConfig = {
   user?: UserConfig;
   onboarding?: OnboardingConfig;
@@ -257,19 +365,7 @@ export type JarvisConfig = {
   voice?: VoiceConfig;
   desktop?: DesktopConfig;
   awareness?: AwarenessConfig;
-  llm: {
-    primary: string;  // provider name
-    fallback: string[];
-    anthropic?: { api_key: string; model?: string };
-    openai?: { api_key: string; model?: string };
-    groq?: { api_key: string; model?: string };
-    gemini?: { api_key: string; model?: string };
-    ollama?: { base_url?: string; model?: string };
-    openrouter?: { api_key: string; model?: string };
-    nvidia?: { api_key: string; model?: string };
-    openai_compatible?: { base_url?: string; api_key?: string; model?: string };
-    litellm?: { base_url?: string; api_key?: string; model?: string };
-  };
+  llm: LLMConfig;
   personality: {
     core_traits: string[];
     assistant_name?: string;
@@ -286,6 +382,7 @@ export type JarvisConfig = {
   };
   authority: AuthorityConfig;
   heartbeat: HeartbeatConfig;
+  cron?: SystemCronConfig;
   active_role: string;  // role file name
 };
 
@@ -345,36 +442,8 @@ export const DEFAULT_CONFIG: JarvisConfig = {
     },
   },
   llm: {
-    primary: 'anthropic',
-    fallback: ['openai', 'ollama'],
-    anthropic: {
-      api_key: '',
-      model: 'claude-sonnet-4-6',
-    },
-    openai: {
-      api_key: '',
-      model: 'gpt-5.4',
-    },
-    groq: {
-      api_key: '',
-      model: 'llama-3.3-70b-versatile',
-    },
-    gemini: {
-      api_key: '',
-      model: 'gemini-3-flash-preview',
-    },
-    ollama: {
-      base_url: '',
-      model: 'llama3',
-    },
-    openrouter: {
-      api_key: '',
-      model: 'anthropic/claude-sonnet-4',
-    },
-    nvidia: {
-      api_key: '',
-      model: 'meta/llama-3.3-70b-instruct',
-    },
+    providers: {},
+    tiers: {},
   },
   personality: {
     core_traits: [

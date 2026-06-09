@@ -29,6 +29,7 @@ import {
 // ── DB keys ──────────────────────────────────────────────────────────────
 const SETTING_PROVIDERS = 'llm.providers';
 const SETTING_DEFAULT = 'llm.default';
+const SETTING_MODE = 'llm.mode';
 const SETTING_TIER_CONVERSATION = 'llm.tiers.conversation';
 const SETTING_TIER_HIGH = 'llm.tiers.high';
 const SETTING_TIER_MEDIUM = 'llm.tiers.medium';
@@ -46,9 +47,19 @@ export type LLMSettingsProviderView = {
   base_url?: string;
 };
 
+export type LLMMode = 'single' | 'multi-tier';
+
 export type LLMSettingsResponse = {
   providers: Record<string, LLMSettingsProviderView>;
   default: string | null;
+  /**
+   * The user's persisted architecture choice. Stored explicitly rather than
+   * inferred from tier presence, so the selection survives reloads even before
+   * a tier model is picked and the user can flip back to single at any time.
+   * Runtime routing still activates router-first only when tiers.conversation
+   * is set (see configureLLMTiers) - this field never drives routing on its own.
+   */
+  mode: LLMMode;
   tiers: {
     conversation: string | null;
     high: string | null;
@@ -67,6 +78,7 @@ export type LLMSettingsRequest = {
     base_url?: string;
   } | null>;            // null deletes the provider
   default?: string | null;     // null clears
+  mode?: LLMMode;              // persisted architecture choice
   tiers?: {
     conversation?: string | null;
     high?: string | null;
@@ -101,15 +113,30 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
     };
   }
 
+  const tiers = {
+    conversation: config.llm.tiers?.conversation ?? null,
+    high: config.llm.tiers?.high ?? null,
+    medium: config.llm.tiers?.medium ?? null,
+    low: config.llm.tiers?.low ?? null,
+  };
+
+  // Mode is read from its own setting. For installs that pre-date this field
+  // (no stored value), fall back to inferring it from tier presence so the
+  // upgrade is seamless.
+  const storedMode = getSetting(SETTING_MODE);
+  const anyTier = tiers.conversation || tiers.high || tiers.medium || tiers.low;
+  const mode: LLMMode =
+    storedMode === 'multi-tier' || storedMode === 'single'
+      ? storedMode
+      : anyTier
+        ? 'multi-tier'
+        : 'single';
+
   return {
     providers,
     default: config.llm.default ?? null,
-    tiers: {
-      conversation: config.llm.tiers?.conversation ?? null,
-      high: config.llm.tiers?.high ?? null,
-      medium: config.llm.tiers?.medium ?? null,
-      low: config.llm.tiers?.low ?? null,
-    },
+    mode,
+    tiers,
     available_kinds: AVAILABLE_KINDS,
   };
 }
@@ -154,6 +181,14 @@ export function saveLLMSettings(
       }
       config.llm.providers[name] = merged;
     }
+  }
+
+  // Persist the architecture choice. Kept in its own setting (not derived) so
+  // the selection survives reloads and the user can flip either direction even
+  // before any tier model is picked. Does NOT drive runtime routing - that
+  // still keys off tiers.conversation in configureLLMTiers.
+  if (body.mode === 'single' || body.mode === 'multi-tier') {
+    setSetting(SETTING_MODE, body.mode);
   }
 
   // Apply default + tier model refs.
@@ -207,17 +242,23 @@ export function stripSecretsFromProviders(
 // ── mergeLLMSettingsIntoConfig ───────────────────────────────────────────
 
 /**
- * Merge DB-stored LLM settings (and keychain secrets) into the in-memory
- * config at startup. Env vars (already applied by loadConfig) take priority;
- * DB values fill in anything env didn't set.
+ * Load ALL LLM settings from the DB + encrypted keychain into the in-memory
+ * config at startup. This is the SOLE source of LLM configuration: providers,
+ * credentials, the single-LLM `default`, and the tier map all come from the
+ * database. config.yaml and env vars contribute nothing (loadConfig discards
+ * any `llm` block and the env loader no longer reads LLM vars), so this fully
+ * REPLACES `config.llm` rather than merging into it - a stale value can never
+ * shadow the dashboard.
  *
  * Also reads legacy DB keys (KEY_ANTHROPIC, SETTING_PRIMARY, etc.) from
  * pre-rework installs and migrates them in-memory so users upgrading don't
  * lose their saved credentials.
  */
 export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
-  if (!config.llm.providers) config.llm.providers = {};
-  if (!config.llm.tiers) config.llm.tiers = {};
+  // Replace, don't merge: the DB is authoritative for every LLM setting.
+  config.llm.providers = {};
+  config.llm.tiers = {};
+  config.llm.default = undefined;
 
   // 1. New shape: load providers JSON + default + tier strings.
   const providersJson = getSetting(SETTING_PROVIDERS);
@@ -225,9 +266,7 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
     try {
       const parsed = JSON.parse(providersJson) as Record<string, LLMProviderEntry>;
       for (const [name, entry] of Object.entries(parsed)) {
-        if (!config.llm.providers[name]) {
-          config.llm.providers[name] = entry;
-        }
+        config.llm.providers[name] = entry;
       }
     } catch (err) {
       console.warn('[LLM] Failed to parse stored providers JSON:', err);
@@ -235,7 +274,7 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
   }
 
   const dbDefault = getSetting(SETTING_DEFAULT);
-  if (dbDefault && !config.llm.default) config.llm.default = dbDefault;
+  if (dbDefault) config.llm.default = dbDefault;
 
   for (const [tier, key] of [
     ['conversation', SETTING_TIER_CONVERSATION],
@@ -244,7 +283,7 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
     ['low', SETTING_TIER_LOW],
   ] as const) {
     const value = getSetting(key);
-    if (value && !config.llm.tiers[tier]) config.llm.tiers[tier] = value;
+    if (value) config.llm.tiers[tier] = value;
   }
 
   // 2. Legacy shape: migrate per-provider DB keys + KEY_* secrets if any
@@ -261,8 +300,9 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
     const key = getSecret(keychainKey(name));
     if (key) {
       // Inject into the entry transiently so registerLLMProviders can
-      // instantiate the provider. This will be stripped before save (see
-      // saveConfig stripLegacyLLMFields and saveLLMSettings).
+      // instantiate the provider. The whole llm block is stripped before any
+      // YAML write (see saveConfig / stripLLMConfigForYAML), and saveLLMSettings
+      // persists secrets only to the keychain.
       config.llm.providers[name] = { ...config.llm.providers[name], api_key: key };
     }
   }

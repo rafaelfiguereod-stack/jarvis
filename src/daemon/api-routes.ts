@@ -55,6 +55,7 @@ import {
   spawnPersistentAgent,
   terminatePersistentAgent,
 } from '../actions/tools/agents.ts';
+import type { AsyncTask } from '../agents/task-manager.ts';
 
 import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
@@ -199,7 +200,43 @@ type AgentTaskSnapshot = {
   task: string;
   startedAt: number;
   completedAt?: number | null;
+  result?: {
+    success: boolean;
+    response: string;
+    toolsUsed: string[];
+    terminationReason: string;
+  } | null;
 };
+
+/** List payloads cap the response so the 5s roster poll never ships a
+ *  full research report per agent; /api/agents/tasks/:id returns it
+ *  whole and the UI fetches that on expand when `response_truncated`. */
+const LIST_RESPONSE_MAX_CHARS = 2000;
+
+/** Serialize a task (with its result, when finished) for API responses.
+ *  The result is the ONLY place the sub-agent's final answer lives for
+ *  dashboard-spawned tasks -- without it the UI could show that a task
+ *  completed but never what it produced. */
+function taskToJSON(task: AgentTaskSnapshot, opts: { full?: boolean } = {}) {
+  const response = task.result?.response ?? '';
+  const truncate = !opts.full && response.length > LIST_RESPONSE_MAX_CHARS;
+  return {
+    id: task.id,
+    status: task.status,
+    task: task.task,
+    started_at: task.startedAt,
+    completed_at: task.completedAt ?? null,
+    result: task.result
+      ? {
+          success: task.result.success,
+          response: truncate ? response.slice(0, LIST_RESPONSE_MAX_CHARS) : response,
+          response_truncated: truncate,
+          tools_used: task.result.toolsUsed,
+          termination_reason: task.result.terminationReason,
+        }
+      : null,
+  };
+}
 
 function buildAgentSnapshots(ctx: ApiContext) {
   const orchestrator = ctx.agentService.getOrchestrator();
@@ -227,13 +264,7 @@ function buildAgentSnapshots(ctx: ApiContext) {
     return {
       ...base,
       busy: busyAgents.has(agent.id),
-      latest_task: latestTask ? {
-        id: latestTask.id,
-        status: latestTask.status,
-        task: latestTask.task,
-        started_at: latestTask.startedAt,
-        completed_at: latestTask.completedAt,
-      } : null,
+      latest_task: latestTask ? taskToJSON(latestTask) : null,
     };
   });
 
@@ -706,6 +737,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             llmManager: ctx.agentService.getLLMManager(),
             specialists: ctx.agentService.getSpecialists(),
             taskManager,
+            // Dashboard-spawned tasks used to run with NO progress callback:
+            // nothing streamed to the live ticker, nothing persisted to the
+            // activity timeline, and the user never learned the task had
+            // finished (let alone what it produced). Mirror the wiring the
+            // PA's manage_agents tool gets at boot.
+            onProgress: (event: { type: 'text' | 'tool_call' | 'done'; agentName: string; agentId: string; data: unknown }) => {
+              ctx.wsService?.broadcastSubAgentProgress(event);
+            },
+            // The completion notification hangs off onTaskComplete, NOT the
+            // 'done' progress event: 'done' only fires on the success path
+            // inside runSubAgent, so a failed task would never notify at
+            // all -- and it carries no success flag to word the message by.
+            onTaskComplete: (task: AsyncTask) => {
+              const ok = task.result?.success ?? false;
+              ctx.wsService?.broadcastNotification(
+                ok
+                  ? `**${task.agentName} finished its task.** Open the Agents room to read the result.`
+                  : `**${task.agentName} could not complete its task.** Open the Agents room for details.`,
+                'normal',
+              );
+            },
           };
 
           const spawned = spawnPersistentAgent(deps, body.specialist ?? '');
@@ -723,13 +775,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           return json({
             ...spawned.agent.toJSON(),
             busy: taskManager.isAgentBusy(spawned.agent.id),
-            latest_task: latestTask ? {
-              id: latestTask.id,
-              status: latestTask.status,
-              task: latestTask.task,
-              started_at: latestTask.startedAt,
-              completed_at: latestTask.completedAt,
-            } : null,
+            latest_task: latestTask ? taskToJSON(latestTask) : null,
             spawned: spawned.summary,
             assignment,
           }, 201);
@@ -823,6 +869,24 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           specialists: ctx.agentService.getSpecialists(),
           taskManager: tm,
         }));
+      },
+    },
+
+    // Full detail for a single async task. The list payloads cap the
+    // result response at LIST_RESPONSE_MAX_CHARS; this returns it whole
+    // (the UI fetches it on expand when `response_truncated` is set).
+    '/api/agents/tasks/:id': {
+      GET: (req: Request & { params: { id: string } }) => {
+        const tm = ctx.agentService.getTaskManager();
+        if (!tm) return error('Persistent agents are not available.', 503);
+        const task = tm.getTask(req.params.id);
+        if (!task) return error(`Task "${req.params.id}" not found.`, 404);
+        return json({
+          ...taskToJSON(task, { full: true }),
+          agent_id: task.agentId,
+          agent_name: task.agentName,
+          specialist_id: task.specialistId,
+        });
       },
     },
 

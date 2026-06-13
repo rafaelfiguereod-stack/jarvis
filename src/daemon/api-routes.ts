@@ -8,6 +8,7 @@
 import type { HealthMonitor } from './health.ts';
 import type { AgentService } from './agent-service.ts';
 import type { JarvisConfig } from '../config/types.ts';
+import { resolveRealtimeVoice, DEFAULT_BLOCKED_CATEGORIES } from '../config/realtime.ts';
 import type { EntityType } from '../vault/entities.ts';
 import type { CommitmentPriority, CommitmentStatus } from '../vault/commitments.ts';
 import type { ObservationType } from '../vault/observations.ts';
@@ -54,6 +55,7 @@ import {
   spawnPersistentAgent,
   terminatePersistentAgent,
 } from '../actions/tools/agents.ts';
+import type { AsyncTask } from '../agents/task-manager.ts';
 
 import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
@@ -198,7 +200,43 @@ type AgentTaskSnapshot = {
   task: string;
   startedAt: number;
   completedAt?: number | null;
+  result?: {
+    success: boolean;
+    response: string;
+    toolsUsed: string[];
+    terminationReason: string;
+  } | null;
 };
+
+/** List payloads cap the response so the 5s roster poll never ships a
+ *  full research report per agent; /api/agents/tasks/:id returns it
+ *  whole and the UI fetches that on expand when `response_truncated`. */
+const LIST_RESPONSE_MAX_CHARS = 2000;
+
+/** Serialize a task (with its result, when finished) for API responses.
+ *  The result is the ONLY place the sub-agent's final answer lives for
+ *  dashboard-spawned tasks -- without it the UI could show that a task
+ *  completed but never what it produced. */
+function taskToJSON(task: AgentTaskSnapshot, opts: { full?: boolean } = {}) {
+  const response = task.result?.response ?? '';
+  const truncate = !opts.full && response.length > LIST_RESPONSE_MAX_CHARS;
+  return {
+    id: task.id,
+    status: task.status,
+    task: task.task,
+    started_at: task.startedAt,
+    completed_at: task.completedAt ?? null,
+    result: task.result
+      ? {
+          success: task.result.success,
+          response: truncate ? response.slice(0, LIST_RESPONSE_MAX_CHARS) : response,
+          response_truncated: truncate,
+          tools_used: task.result.toolsUsed,
+          termination_reason: task.result.terminationReason,
+        }
+      : null,
+  };
+}
 
 function buildAgentSnapshots(ctx: ApiContext) {
   const orchestrator = ctx.agentService.getOrchestrator();
@@ -226,13 +264,7 @@ function buildAgentSnapshots(ctx: ApiContext) {
     return {
       ...base,
       busy: busyAgents.has(agent.id),
-      latest_task: latestTask ? {
-        id: latestTask.id,
-        status: latestTask.status,
-        task: latestTask.task,
-        started_at: latestTask.startedAt,
-        completed_at: latestTask.completedAt,
-      } : null,
+      latest_task: latestTask ? taskToJSON(latestTask) : null,
     };
   });
 
@@ -705,6 +737,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             llmManager: ctx.agentService.getLLMManager(),
             specialists: ctx.agentService.getSpecialists(),
             taskManager,
+            // Dashboard-spawned tasks used to run with NO progress callback:
+            // nothing streamed to the live ticker, nothing persisted to the
+            // activity timeline, and the user never learned the task had
+            // finished (let alone what it produced). Mirror the wiring the
+            // PA's manage_agents tool gets at boot.
+            onProgress: (event: { type: 'text' | 'tool_call' | 'done'; agentName: string; agentId: string; data: unknown }) => {
+              ctx.wsService?.broadcastSubAgentProgress(event);
+            },
+            // The completion notification hangs off onTaskComplete, NOT the
+            // 'done' progress event: 'done' only fires on the success path
+            // inside runSubAgent, so a failed task would never notify at
+            // all -- and it carries no success flag to word the message by.
+            onTaskComplete: (task: AsyncTask) => {
+              const ok = task.result?.success ?? false;
+              ctx.wsService?.broadcastNotification(
+                ok
+                  ? `**${task.agentName} finished its task.** Open the Agents room to read the result.`
+                  : `**${task.agentName} could not complete its task.** Open the Agents room for details.`,
+                'normal',
+              );
+            },
           };
 
           const spawned = spawnPersistentAgent(deps, body.specialist ?? '');
@@ -722,13 +775,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           return json({
             ...spawned.agent.toJSON(),
             busy: taskManager.isAgentBusy(spawned.agent.id),
-            latest_task: latestTask ? {
-              id: latestTask.id,
-              status: latestTask.status,
-              task: latestTask.task,
-              started_at: latestTask.startedAt,
-              completed_at: latestTask.completedAt,
-            } : null,
+            latest_task: latestTask ? taskToJSON(latestTask) : null,
             spawned: spawned.summary,
             assignment,
           }, 201);
@@ -822,6 +869,24 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           specialists: ctx.agentService.getSpecialists(),
           taskManager: tm,
         }));
+      },
+    },
+
+    // Full detail for a single async task. The list payloads cap the
+    // result response at LIST_RESPONSE_MAX_CHARS; this returns it whole
+    // (the UI fetches it on expand when `response_truncated` is set).
+    '/api/agents/tasks/:id': {
+      GET: (req: Request & { params: { id: string } }) => {
+        const tm = ctx.agentService.getTaskManager();
+        if (!tm) return error('Persistent agents are not available.', 503);
+        const task = tm.getTask(req.params.id);
+        if (!task) return error(`Task "${req.params.id}" not found.`, 404);
+        return json({
+          ...taskToJSON(task, { full: true }),
+          agent_id: task.agentId,
+          agent_name: task.agentName,
+          specialist_id: task.specialistId,
+        });
       },
     },
 
@@ -971,6 +1036,59 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             cleared,
             client_cache_keys: clientCacheKeys,
             message: `Onboarding reset (${cleared.join(', ')}).`,
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Skip the ENTIRE onboarding flow from the first setup screen. No LLM
+     * is configured, so the daemon stays chat-less until the user wires a
+     * provider up in Settings → LLM — but the dashboard becomes reachable
+     * immediately. Marks setup complete, opts out of the profile
+     * interview, and dismisses the tutorial in one write. Existing
+     * timestamps are preserved so a skip after a partial run never
+     * regresses state.
+     */
+    '/api/onboarding/skip': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            ...fresh.onboarding,
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? now,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at ?? now,
+            setup_skipped_profile: true,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+
+          // Best-effort service start so the "Restart Jarvis" banner
+          // doesn't nag after a skip. Failure is non-fatal — services
+          // that need an LLM just stay idle until one is configured.
+          let postSetupStarted = false;
+          if (ctx.startPostSetupServices) {
+            try {
+              await ctx.startPostSetupServices();
+              postSetupStarted = true;
+            } catch (err) {
+              console.warn(
+                '[Onboarding] Post-setup services skipped after onboarding skip:',
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
+
+          return json({
+            ok: true,
+            setup_completed_at: fresh.onboarding.setup_completed_at,
+            post_setup_services_started: postSetupStarted,
+            message: 'Onboarding skipped. Configure an LLM in Settings to start chatting.',
           });
         } catch (err) {
           return errorFromException(err);
@@ -1155,30 +1273,39 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             hotReloadLLMProviders(ctx.config, ctx.agentService.getLLMManager());
           }
 
-          // 2. STT settings — mirrors /api/config/stt POST semantics via
-          //    the shared mergeSTTConfig helper. STT is consumed at the
-          //    next transcription request, so no hot-swap is needed.
+          // 2. STT + TTS + the setup-completed flag in ONE config write.
+          //    These used to be three sequential load→save round-trips; a
+          //    daemon kill (or crash) between them persisted setup HALF-done
+          //    — TTS saved but the completion flag lost — and the user was
+          //    funneled back into onboarding on the next boot.
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeSTTConfig, mergeTTSConfig } = await import('./config-merge.ts');
+          const fresh = await loadConfig();
           if (body.stt) {
-            const { loadConfig: lc, saveConfig: sc } = await import('../config/loader.ts');
-            const { mergeSTTConfig } = await import('./config-merge.ts');
-            const fresh = await lc();
+            // Mirrors /api/config/stt POST semantics. STT is consumed at
+            // the next transcription request, so no hot-swap is needed.
             fresh.stt = mergeSTTConfig(fresh.stt, body.stt);
-            await sc(fresh);
-            ctx.config.stt = fresh.stt;
           }
-
-          // 3. TTS settings — mirrors /api/config/tts POST via the shared
-          //    mergeTTSConfig helper, then hot-reloads the provider so the
-          //    post-setup "Welcome to Jarvis" reply is spoken immediately.
           if (body.tts) {
-            const { loadConfig: lc, saveConfig: sc } = await import('../config/loader.ts');
-            const { mergeTTSConfig } = await import('./config-merge.ts');
-            const fresh = await lc();
             fresh.tts = mergeTTSConfig(fresh.tts, body.tts);
-            await sc(fresh);
-            ctx.config.tts = fresh.tts;
-            // Hot-reload TTS provider when possible so the post-setup
-            // "Welcome to Jarvis" reply is spoken immediately.
+          }
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: now,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            setup_skipped_profile: fresh.onboarding?.setup_skipped_profile,
+            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at,
+            tutorial_progress_step: fresh.onboarding?.tutorial_progress_step,
+            last_reset_at: fresh.onboarding?.last_reset_at,
+          };
+          await saveConfig(fresh);
+          if (body.stt) ctx.config.stt = fresh.stt;
+          if (body.tts) ctx.config.tts = fresh.tts;
+          ctx.config.onboarding = fresh.onboarding;
+
+          // 3. Hot-reload the TTS provider when possible so the post-setup
+          //    "Welcome to Jarvis" reply is spoken immediately.
+          if (body.tts) {
             try {
               if (ctx.config.tts && ctx.wsService) {
                 const { createTTSProvider } = await import('../comms/voice.ts');
@@ -1190,22 +1317,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             }
           }
 
-          // 4. Flip the setup-completed flag.
-          const { loadConfig, saveConfig } = await import('../config/loader.ts');
-          const fresh = await loadConfig();
-          const now = Date.now();
-          fresh.onboarding = {
-            setup_completed_at: now,
-            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
-            setup_skipped_profile: fresh.onboarding?.setup_skipped_profile,
-            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at,
-            tutorial_progress_step: fresh.onboarding?.tutorial_progress_step,
-            last_reset_at: fresh.onboarding?.last_reset_at,
-          };
-          await saveConfig(fresh);
-          ctx.config.onboarding = fresh.onboarding;
-
-          // 5. Bring the LLM-dependent services (bgAgent, commitment
+          // 4. Bring the LLM-dependent services (bgAgent, commitment
           //    executor, awareness) online in-process. Without this the
           //    user would have to restart the daemon — fatal UX on
           //    Docker / VPS. Failure here is non-fatal: chat still works
@@ -1242,25 +1354,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const config = ctx.config;
         return json({
           daemon: config.daemon,
+          // LLM config is DB/keychain-managed (dashboard). Report a sanitized
+          // canonical summary - provider names, single-LLM default, and the
+          // tier map. The dedicated dashboard endpoint is /api/config/llm.
           llm: {
-            primary: config.llm.primary,
-            fallback: config.llm.fallback,
-            anthropic: config.llm.anthropic ? { model: config.llm.anthropic.model } : null,
-            openai: config.llm.openai ? { model: config.llm.openai.model } : null,
-            groq: config.llm.groq ? { model: config.llm.groq.model } : null,
-            ollama: config.llm.ollama ?? null,
-            openai_compatible: config.llm.openai_compatible
-              ? {
-                  base_url: config.llm.openai_compatible.base_url,
-                  model: config.llm.openai_compatible.model,
-                }
-              : null,
-            litellm: config.llm.litellm
-              ? {
-                  base_url: config.llm.litellm.base_url,
-                  model: config.llm.litellm.model,
-                }
-              : null,
+            providers: Object.keys(config.llm.providers ?? {}),
+            default: config.llm.default ?? null,
+            tiers: config.llm.tiers ?? {},
           },
           personality: config.personality,
           authority: config.authority,
@@ -1352,7 +1452,10 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       GET: async () => {
         try {
           const { NVIDIAProvider } = await import('../llm/nvidia.ts');
-          const key = ctx.config.llm.nvidia?.api_key ?? '';
+          // Key (if any) lives in the keychain, keyed by provider name. NVIDIA's
+          // /v1/models is publicly readable, so an empty key still works.
+          const { getSecret } = await import('../vault/keychain.ts');
+          const key = getSecret('llm.provider.nvidia.api_key') ?? '';
           const provider = new NVIDIAProvider(key);
           const models = await provider.listModels();
           return json({ ok: true, models });
@@ -1360,6 +1463,102 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const msg = err instanceof Error ? err.message : String(err);
           return json({ ok: false, error: msg, models: [] });
         }
+      },
+    },
+
+    // --- Usage telemetry ---
+    /**
+     * Filterable LLM usage query. All query params are optional:
+     *   from, to        unix-ms range bounds (default: last 30 days -> now)
+     *   tier            CSV: conversation,high,medium,low
+     *   model           CSV
+     *   subsystem       CSV
+     *   provider        CSV
+     *   errors_only     "true" | "false" | "" (both)
+     *   group_by        tier | model | subsystem | provider | date | none
+     *                   default: model
+     */
+    '/api/usage': {
+      GET: async (req: Request) => {
+        try {
+          const { queryUsage } = await import('../llm/usage.ts');
+          const url = new URL(req.url);
+          const get = (k: string) => url.searchParams.get(k);
+
+          const parseCsv = (v: string | null): string[] | undefined => {
+            if (!v) return undefined;
+            const list = v.split(',').map((s) => s.trim()).filter(Boolean);
+            return list.length > 0 ? list : undefined;
+          };
+          const parseInt64 = (v: string | null): number | undefined => {
+            if (!v) return undefined;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : undefined;
+          };
+          const errorsOnlyRaw = get('errors_only');
+          const errorsOnly = errorsOnlyRaw === 'true' ? true : errorsOnlyRaw === 'false' ? false : undefined;
+          const groupByRaw = get('group_by') ?? 'model';
+          const validGroups = ['tier', 'model', 'subsystem', 'provider', 'date', 'none'] as const;
+          const groupBy = (validGroups as readonly string[]).includes(groupByRaw)
+            ? (groupByRaw as typeof validGroups[number])
+            : 'model';
+
+          const result = queryUsage(
+            {
+              fromMs: parseInt64(get('from')),
+              toMs: parseInt64(get('to')),
+              tiers: parseCsv(get('tier')),
+              models: parseCsv(get('model')),
+              subsystems: parseCsv(get('subsystem')),
+              providers: parseCsv(get('provider')),
+              errorsOnly,
+            },
+            groupBy,
+          );
+          return json(result);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, rows: [], total: { calls: 0, input_tokens: 0, output_tokens: 0, total_latency_ms: 0, errors: 0 } });
+        }
+      },
+    },
+
+    /** Distinct filter values + date range present in the DB. Used by the
+     *  Usage room to populate filter dropdowns with only-extant choices. */
+    '/api/usage/filters': {
+      GET: async () => {
+        try {
+          const { listUsageDistinctValues } = await import('../llm/usage.ts');
+          return json(listUsageDistinctValues());
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, tiers: [], models: [], subsystems: [], providers: [], earliest_ts: null, latest_ts: null });
+        }
+      },
+    },
+
+    /**
+     * Paused conv-tier tasks (status === 'needs_input'). Used by the dashboard
+     * to surface pending questions after a daemon restart - durability lands
+     * them back in the registry on boot, this endpoint makes them visible to
+     * the user. The conv LLM separately picks them up via registry context.
+     * Returns an empty list when running in classic mode (no task registry).
+     */
+    '/api/tasks/paused': {
+      GET: () => {
+        const registry = ctx.agentService.getTaskRegistry();
+        if (!registry) return json({ tasks: [] });
+        const tasks = registry.inFlight()
+          .filter((t) => t.status === 'needs_input')
+          .map((t) => ({
+            id: t.id,
+            template: t.request.template,
+            intent: t.request.intent,
+            question: t.question ?? '',
+            started_at: t.startedAt,
+            updated_at: t.updatedAt,
+          }));
+        return json({ tasks });
       },
     },
 
@@ -1899,6 +2098,65 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // --- Voice (wake engine + premium realtime gpt-realtime-2) ---
+    '/api/config/voice': {
+      GET: () => {
+        const voice = ctx.config.voice;
+        const rt = voice?.realtime;
+        // Surface whether realtime would actually resolve (BYO key cascade),
+        // so the UI can show "active / no key" without exposing secrets.
+        let available = false;
+        try {
+          available = resolveRealtimeVoice(ctx.config).ok;
+        } catch { available = false; }
+        return json({
+          wake_engine: voice?.wake_engine ?? 'openwakeword',
+          realtime: {
+            enabled: rt?.enabled ?? false,
+            model: rt?.model ?? 'gpt-realtime-2',
+            voice: rt?.voice ?? null,
+            reasoning_effort: rt?.reasoning_effort ?? 'low',
+            max_session_minutes: rt?.max_session_minutes ?? 10,
+            monthly_budget_usd: rt?.monthly_budget_usd ?? null,
+            // Report the EFFECTIVE backstop, not the raw field. When unset the
+            // resolver applies DEFAULT_BLOCKED_CATEGORIES, so returning `[]`
+            // here would both misreport ("nothing blocked" while payments/etc.
+            // are blocked) and let a read-modify-write round-trip persist `[]`,
+            // silently disabling the safe default. `default` flags which case
+            // it is so a client can tell "using the default" from an explicit set.
+            blocked_categories: rt?.blocked_categories ?? DEFAULT_BLOCKED_CATEGORIES,
+            blocked_categories_default: rt?.blocked_categories === undefined,
+            // true when enabled AND an OpenAI provider key resolves (via
+            // llm.providers or env) - reflects whether realtime would actually
+            // start if voice_start arrived right now.
+            available,
+          },
+        });
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as Record<string, unknown>;
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeVoiceConfig, validateVoicePatch } = await import('./config-merge.ts');
+
+          const validation = validateVoicePatch(body);
+          if (!validation.ok) return error(validation.error, 400);
+
+          const freshConfig = await loadConfig();
+          freshConfig.voice = mergeVoiceConfig(freshConfig.voice, validation.patch);
+          await saveConfig(freshConfig);
+          // Update in-memory config so the next voice_start resolves with the
+          // new settings — resolveRealtimeVoice reads ctx.config live, so no
+          // provider hot-reload is needed (unlike TTS/LLM).
+          ctx.config.voice = freshConfig.voice;
+          return json({ ok: true, message: 'Voice config saved.' });
+        } catch (err) {
+          console.error('[API] Error saving voice config:', err);
+          return error('Invalid request body');
+        }
+      },
+    },
+
     // --- TTS Voices ---
     '/api/tts/voices': {
       GET: async (req: Request) => {
@@ -1997,8 +2255,11 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         // the originating `request_approval` tool call is blocked waiting for
         // the DB status to flip (via waitForResolution polling). Skipping
         // executeApproved avoids a recursive call into the tool registry.
+        // Inline-mode requests are likewise executed by the authority gate
+        // that is blocked on this status flip, so the result flows back to
+        // the conversation — executing here would run the tool twice.
         let result = '';
-        if (approved.tool_name !== 'request_approval') {
+        if (approved.tool_name !== 'request_approval' && approved.execution_mode !== 'inline') {
           result = await ctx.deferredExecutor.executeApproved(requestId);
         }
 

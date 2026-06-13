@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { ArrowRight, Check, Loader2, Mic, MicOff, Volume2, VolumeX, type LucideIcon } from "lucide-react";
+import { ArrowRight, Check, Loader2, Mic, MicOff, SkipForward, Volume2, VolumeX, type LucideIcon } from "lucide-react";
 import { Button, Icon } from "../ui";
 import "./SetupRoom.css";
 
@@ -159,6 +159,27 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
     | null
   >(null);
 
+  // Advanced setup: assign separate models per tier so the router-first
+  // architecture is on from first boot. All four tiers reuse the picked
+  // provider + key (cross-provider setups happen in Settings later). When
+  // the user toggles advanced on, we seed tier slots from `model` so they
+  // start with sensible values instead of empty dropdowns.
+  type LlmSetupMode = "single" | "multi-tier";
+  const [llmMode, setLlmMode] = useState<LlmSetupMode>("single");
+  const [tierConversation, setTierConversation] = useState("");
+  const [tierHigh, setTierHigh] = useState("");
+  const [tierMedium, setTierMedium] = useState("");
+  const [tierLow, setTierLow] = useState("");
+  const enterAdvanced = () => {
+    // Seed any unset tier from the basic model so the user has working
+    // defaults to refine rather than four empty pickers.
+    if (!tierConversation) setTierConversation(model);
+    if (!tierHigh) setTierHigh(model);
+    if (!tierMedium) setTierMedium(model);
+    if (!tierLow) setTierLow(model);
+    setLlmMode("multi-tier");
+  };
+
   // NVIDIA's catalog rotates, so we fetch live IDs. Falls back to the
   // hardcoded `provider.models` if the call fails (offline, daemon down).
   // The list mixes chat / embedding / vision models — there's no type
@@ -225,6 +246,34 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
   // ── Submit state ───────────────────────────────────────────────────
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [skipping, setSkipping] = useState(false);
+  const [skipError, setSkipError] = useState<string | null>(null);
+
+  // Escape hatch available from every setup screen. No LLM gets
+  // configured, so Jarvis can't chat until the user wires a provider
+  // up in Settings — but they reach the dashboard immediately.
+  const handleSkipSetup = async () => {
+    if (
+      !confirm(
+        "Skip setup? Jarvis won't be able to respond until you configure an LLM in Settings. You can re-run onboarding any time from Settings.",
+      )
+    ) {
+      return;
+    }
+    setSkipping(true);
+    setSkipError(null);
+    try {
+      const r = await fetch("/api/onboarding/skip", { method: "POST" });
+      if (!r.ok) {
+        const text = await r.text().catch(() => `HTTP ${r.status}`);
+        throw new Error(text || `HTTP ${r.status}`);
+      }
+      onComplete();
+    } catch (err) {
+      setSkipError(err instanceof Error ? err.message : "Skip failed.");
+      setSkipping(false);
+    }
+  };
 
   const handlePickProvider = (id: LLMProviderId) => {
     setProviderId(id);
@@ -247,7 +296,14 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
     setTesting(true);
     setTestResult(null);
     try {
-      const body: Record<string, unknown> = { provider: providerId, model };
+      // In multi-tier mode test the high-tier model: it's the most
+      // important one (never falls up, drives complex reasoning). If high
+      // is empty fall through to medium / conversation / basic model so
+      // the button always has something to validate.
+      const testModel = llmMode === "multi-tier"
+        ? (tierHigh || tierMedium || tierConversation || model)
+        : model;
+      const body: Record<string, unknown> = { provider: providerId, model: testModel };
       if (provider.needsKey) {
         if (!apiKey) {
           setTestResult({ ok: false, error: "Enter an API key first." });
@@ -284,7 +340,15 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
     }
   };
 
-  const llmReady = testResult?.ok === true;
+  // Multi-tier requires at least one of medium/high to be assigned -
+  // task tiers fall up to those, so without one the manager would refuse
+  // to resolve any task call. (validateTierMap on the backend enforces
+  // this too; we gate the Continue button here so the user gets a clear
+  // signal in-form instead of a 400 from the setup POST.)
+  const advancedTiersReady =
+    llmMode === "single" ||
+    Boolean((tierMedium && tierMedium.trim()) || (tierHigh && tierHigh.trim()));
+  const llmReady = testResult?.ok === true && advancedTiersReady;
 
   // Gate the STT Continue button so we never persist a cloud provider with
   // no key (which fails at first transcription) or a local endpoint of "".
@@ -300,14 +364,36 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
     setSaving(true);
     setSaveError(null);
     try {
-      // Build the LLM payload — omit api_key if local provider.
-      const llmBlock: Record<string, unknown> = { primary: providerId };
-      const provBlock: Record<string, unknown> = { model };
-      if (provider.needsKey && apiKey) provBlock.api_key = apiKey;
-      // openai_compatible: api_key is optional, forward when provided.
-      if (provider.optionalKey && apiKey) provBlock.api_key = apiKey;
-      if (provider.needsBaseUrl) provBlock.base_url = baseUrl.trim();
-      llmBlock[providerId] = provBlock;
+      // Build the LLM payload in the new (provider-name + model-ref) shape:
+      //   { providers: { <name>: { kind, api_key?, base_url? } }, default: "name:model" }
+      // The provider name defaults to the kind id for first-time setup
+      // (e.g. "anthropic"). Users with custom names use the dashboard.
+      const providerEntry: Record<string, unknown> = { kind: providerId };
+      if (provider.needsKey && apiKey) providerEntry.api_key = apiKey;
+      if (provider.optionalKey && apiKey) providerEntry.api_key = apiKey;
+      if (provider.needsBaseUrl) providerEntry.base_url = baseUrl.trim();
+
+      const llmBlock: Record<string, unknown> = {
+        providers: { [providerId]: providerEntry },
+      };
+      if (llmMode === "multi-tier") {
+        // Send only the tiers the user filled; the backend deletes any
+        // slot we send with a null/empty value, but a brand-new config
+        // already has them all unset so we just omit the empties.
+        const tiers: Record<string, string | null> = {};
+        const ref = (m: string) => `${providerId}:${m.trim()}`;
+        if (tierConversation.trim()) tiers.conversation = ref(tierConversation);
+        if (tierHigh.trim()) tiers.high = ref(tierHigh);
+        if (tierMedium.trim()) tiers.medium = ref(tierMedium);
+        if (tierLow.trim()) tiers.low = ref(tierLow);
+        llmBlock.tiers = tiers;
+        // Also set a basic `default` as the fall-up safety net (matches
+        // the way the in-app LLM tab keeps `default` as fallback even in
+        // multi-tier mode).
+        llmBlock.default = `${providerId}:${(tierHigh || tierMedium || tierConversation || model).trim()}`;
+      } else {
+        llmBlock.default = `${providerId}:${model}`;
+      }
 
       // Build the TTS payload — explicit choice always sent so the
       // user's "off" decision is recorded, not just defaulted.
@@ -386,7 +472,22 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
               3 · Voice Out
             </div>
           </div>
+          <button
+            type="button"
+            className="v2-setup__skip"
+            onClick={handleSkipSetup}
+            disabled={skipping || saving}
+          >
+            <Icon icon={SkipForward} size="sm" />
+            {skipping ? "Skipping…" : "Skip setup"}
+          </button>
         </header>
+
+        {skipError && (
+          <div className="v2-setup__error" role="alert">
+            {skipError}
+          </div>
+        )}
 
         {screen === "llm" ? (
           <section className="v2-setup__screen">
@@ -496,7 +597,7 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
               </div>
             )}
 
-            {providerId === "nvidia" ? (
+            {llmMode === "single" && (providerId === "nvidia" ? (
               (() => {
                 const liveModels = nvidiaModels && nvidiaModels.length > 0
                   ? nvidiaModels
@@ -621,7 +722,43 @@ export function SetupRoom({ onComplete }: { onComplete: () => void }) {
                   />
                 )}
               </div>
+            ))}
+
+            {llmMode === "multi-tier" && (
+              <AdvancedTierPickers
+                provider={provider}
+                providerId={providerId}
+                nvidiaModels={nvidiaModels}
+                tierConversation={tierConversation}
+                setTierConversation={(m) => { setTierConversation(m); setTestResult(null); }}
+                tierHigh={tierHigh}
+                setTierHigh={(m) => { setTierHigh(m); setTestResult(null); }}
+                tierMedium={tierMedium}
+                setTierMedium={(m) => { setTierMedium(m); setTestResult(null); }}
+                tierLow={tierLow}
+                setTierLow={(m) => { setTierLow(m); setTestResult(null); }}
+              />
             )}
+
+            <div className="v2-setup__mode-toggle">
+              {llmMode === "single" ? (
+                <button
+                  type="button"
+                  className="v2-setup__link"
+                  onClick={enterAdvanced}
+                >
+                  Advanced setup (per-tier models)
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="v2-setup__link"
+                  onClick={() => { setLlmMode("single"); setTestResult(null); }}
+                >
+                  Back to single-model setup
+                </button>
+              )}
+            </div>
 
             <div className="v2-setup__test-row">
               <Button
@@ -932,3 +1069,89 @@ function ChoiceCard({
   );
 }
 
+
+
+// Inline tier picker bank used by the onboarding LLM screen when the user
+// flips on "Advanced setup". Reuses the same provider catalogue as the
+// single-model picker (provider.models + the optional live NVIDIA catalog)
+// so models match exactly. Cross-provider tiers are a settings-room
+// concern; here every tier rides the same provider/key the user just
+// configured above.
+function AdvancedTierPickers({
+  provider,
+  providerId,
+  nvidiaModels,
+  tierConversation, setTierConversation,
+  tierHigh, setTierHigh,
+  tierMedium, setTierMedium,
+  tierLow, setTierLow,
+}: {
+  provider: (typeof PROVIDERS)[number];
+  providerId: LLMProviderId;
+  nvidiaModels: string[] | null;
+  tierConversation: string; setTierConversation: (m: string) => void;
+  tierHigh: string; setTierHigh: (m: string) => void;
+  tierMedium: string; setTierMedium: (m: string) => void;
+  tierLow: string; setTierLow: (m: string) => void;
+}) {
+  const liveModels = providerId === "nvidia" && nvidiaModels && nvidiaModels.length > 0
+    ? nvidiaModels
+    : provider.models;
+
+  const tiers: Array<{ id: string; label: string; sub: string; value: string; set: (m: string) => void }> = [
+    { id: "conversation", label: "Conversation", sub: "Thin LLM that drives dialogue and routes work. Setting any tier activates router-first.", value: tierConversation, set: setTierConversation },
+    { id: "high", label: "High intelligence", sub: "Complex reasoning, planning, deep code.", value: tierHigh, set: setTierHigh },
+    { id: "medium", label: "Medium intelligence", sub: "General tool use, workflow orchestration.", value: tierMedium, set: setTierMedium },
+    { id: "low", label: "Low intelligence", sub: "Classification, summarisation, fast cheap calls.", value: tierLow, set: setTierLow },
+  ];
+
+  return (
+    <div className="v2-setup__field">
+      <label className="v2-setup__label">Tier models</label>
+      <p className="v2-setup__hint" style={{ marginBottom: "var(--s-2)" }}>
+        Set at least the high or medium tier. Empty tiers fall up: low -&gt; medium -&gt; high.
+        All tiers reuse the provider configured above; mix providers later from Settings &gt; LLM.
+      </p>
+      <div className="v2-setup__tiers">
+        {tiers.map((t) => (
+          <div key={t.id} className="v2-setup__tier-row">
+            <div className="v2-setup__tier-meta">
+              <div className="v2-setup__tier-label">{t.label}</div>
+              <div className="v2-setup__tier-sub">{t.sub}</div>
+            </div>
+            <div className="v2-setup__tier-input">
+              {liveModels.length > 0 && (
+                <select
+                  className="v2-setup__select"
+                  value={liveModels.includes(t.value) ? t.value : (t.value ? "custom" : "")}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "") t.set("");
+                    else if (v === "custom") t.set(t.value || "");
+                    else t.set(v);
+                  }}
+                >
+                  <option value="">(unset, falls up)</option>
+                  {liveModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                  <option value="custom">Custom...</option>
+                </select>
+              )}
+              {(liveModels.length === 0 || (t.value && !liveModels.includes(t.value))) && (
+                <input
+                  className="v2-setup__input"
+                  value={t.value}
+                  onChange={(e) => t.set(e.target.value)}
+                  placeholder={liveModels.length === 0 ? "model id" : "custom model id"}
+                  autoComplete="off"
+                  style={{ marginTop: liveModels.length > 0 ? "var(--s-1)" : 0 }}
+                />
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

@@ -69,6 +69,37 @@
 .v2-setup__progress-step[data-done="true"] { color: var(--ok); }
 .v2-setup__progress-sep { opacity: 0.4; }
 
+.v2-setup__skip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  color: var(--ink-2);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+
+.v2-setup__skip:hover {
+  background: var(--paper-3);
+  color: var(--ink);
+}
+
+.v2-setup__skip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.v2-setup__skip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ── Screen ── */
 
 .v2-setup__screen {
@@ -295,3 +326,65 @@
 @media (prefers-reduced-motion: reduce) {
   .v2-setup__spin { animation: none; }
 }
+
+
+/* Advanced setup: per-tier model pickers */
+
+.v2-setup__mode-toggle {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--s-2);
+  margin-bottom: var(--s-3);
+}
+
+.v2-setup__link {
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.v2-setup__link:hover {
+  color: var(--accent);
+}
+
+.v2-setup__tiers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.v2-setup__tier-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-3);
+  align-items: start;
+  padding: var(--s-2) var(--s-3);
+  background: var(--paper-2);
+  border: var(--hair);
+  border-radius: var(--r-1);
+}
+
+.v2-setup__tier-label {
+  font-weight: 600;
+  color: var(--ink);
+  font-size: var(--text-sm);
+}
+
+.v2-setup__tier-sub {
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.v2-setup__tier-input {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+

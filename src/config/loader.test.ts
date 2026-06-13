@@ -1,8 +1,8 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
 import { loadConfig, saveConfig } from './loader.ts';
 import { DEFAULT_CONFIG } from './types.ts';
-import { existsSync, statSync } from 'node:fs';
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { existsSync, lstatSync, statSync } from 'node:fs';
+import { chmod, mkdtemp, readdir, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, isAbsolute } from 'node:path';
 
@@ -35,17 +35,24 @@ describe('Config Loader', () => {
     expect(config.active_role).toBe(DEFAULT_CONFIG.active_role);
   });
 
-  test('can save and load config', async () => {
+  test('can save and load config; LLM config is never persisted to YAML', async () => {
     const testConfig = structuredClone(DEFAULT_CONFIG);
     testConfig.daemon.port = 9999;
-    testConfig.llm.primary = 'openai';
+    // LLM config lives only in the DB + keychain (dashboard-managed). Even when
+    // present in the in-memory config, it must never be written to config.yaml.
+    testConfig.llm.providers = { openai: { api_key: 'sk-test' } };
+    testConfig.llm.default = 'openai:gpt-4o-mini';
 
     await saveConfig(testConfig, TEST_CONFIG_PATH);
     expect(existsSync(TEST_CONFIG_PATH)).toBe(true);
+    const text = await Bun.file(TEST_CONFIG_PATH).text();
+    expect(text).not.toContain('llm:');
+    expect(text).not.toContain('sk-test');
 
     const loaded = await loadConfig(TEST_CONFIG_PATH);
     expect(loaded.daemon.port).toBe(9999);
-    expect(loaded.llm.primary).toBe('openai');
+    // The llm block was stripped on save and is discarded on load.
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
   });
 
   test('saves config with owner-only permissions', async () => {
@@ -72,8 +79,9 @@ describe('Config Loader', () => {
     }
   });
 
-  test('deep merges partial config with defaults', async () => {
-    // Save a partial config (only some fields)
+  test('deep merges partial config with defaults; any llm block is discarded', async () => {
+    // Save a partial config (only some fields). The llm block is legacy and
+    // must be ignored entirely - LLM config comes only from the DB.
     const partialYaml = `
 daemon:
   port: 8888
@@ -88,7 +96,8 @@ llm:
 
     // Should have our custom values
     expect(loaded.daemon.port).toBe(8888);
-    expect(loaded.llm.primary).toBe('openai');
+    // The llm block has no authority and is discarded back to the empty default.
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
 
     // Should have defaults for missing values (paths are tilde-expanded)
     expect(loaded.daemon.data_dir).not.toContain('~');
@@ -143,7 +152,7 @@ llm:
     await Bun.write(TEST_CONFIG_PATH, '');
     const loaded = await loadConfig(TEST_CONFIG_PATH);
     expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
-    expect(loaded.llm.primary).toBe(DEFAULT_CONFIG.llm.primary);
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
     expect(loaded.daemon.data_dir).not.toContain('~');
   });
 
@@ -219,7 +228,7 @@ llm:
     expect(secondText).toBe(firstText);
   });
 
-  test('round-trips channel config and multi-provider fallbacks', async () => {
+  test('round-trips channel config; the entire LLM block is stripped from YAML', async () => {
     const testConfig = structuredClone(DEFAULT_CONFIG);
     testConfig.channels = {
       telegram: {
@@ -234,26 +243,29 @@ llm:
         guild_id: 'guild-123',
       },
     };
-    testConfig.llm.primary = 'ollama';
-    testConfig.llm.fallback = ['gemini', 'openai'];
-    testConfig.llm.gemini = {
-      api_key: 'gemini-key',
-      model: 'gemini-3-flash-preview',
+    // All of this is dashboard/DB-managed and must never touch config.yaml.
+    testConfig.llm.providers = {
+      ollama: { base_url: 'http://localhost:11434' },
+      gemini: { api_key: 'gemini-key' },
     };
-    testConfig.llm.ollama = {
-      base_url: 'http://localhost:11434',
-      model: 'llama3.1',
+    testConfig.llm.tiers = {
+      conversation: 'gemini:gemini-3-flash-preview',
+      medium: 'ollama:llama3.1',
     };
 
     await saveConfig(testConfig, TEST_CONFIG_PATH);
-    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    const text = await Bun.file(TEST_CONFIG_PATH).text();
+    // Non-LLM config persists; the LLM block (and any secret) is gone entirely.
+    expect(text).toContain('channels:');
+    expect(text).not.toContain('llm:');
+    expect(text).not.toContain('gemini-key');
 
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
     expect(loaded.channels?.discord?.enabled).toBe(true);
     expect(loaded.channels?.discord?.guild_id).toBe('guild-123');
-    expect(loaded.llm.primary).toBe('ollama');
-    expect(loaded.llm.fallback).toEqual(['gemini', 'openai']);
-    expect(loaded.llm.gemini?.model).toBe('gemini-3-flash-preview');
-    expect(loaded.llm.ollama?.model).toBe('llama3.1');
+    // LLM config has no authority in config.yaml: stripped on save, discarded
+    // on load. It is sourced solely from the DB at runtime.
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
   });
 });
 
@@ -265,8 +277,8 @@ describe('Default Config', () => {
     expect(DEFAULT_CONFIG.daemon.db_path).toBe('~/.jarvis/jarvis.db');
 
     expect(DEFAULT_CONFIG.llm).toBeDefined();
-    expect(DEFAULT_CONFIG.llm.primary).toBe('anthropic');
-    expect(DEFAULT_CONFIG.llm.fallback).toEqual(['openai', 'ollama']);
+    expect(DEFAULT_CONFIG.llm.providers).toBeDefined();
+    expect(DEFAULT_CONFIG.llm.tiers).toBeDefined();
 
     expect(DEFAULT_CONFIG.personality).toBeDefined();
     expect(DEFAULT_CONFIG.personality.core_traits).toBeInstanceOf(Array);
@@ -287,11 +299,11 @@ describe('Default Config', () => {
   });
 
   test('has correct LLM defaults', () => {
-    expect(DEFAULT_CONFIG.llm.anthropic?.model).toBe('claude-sonnet-4-6');
-    expect(DEFAULT_CONFIG.llm.openai?.model).toBe('gpt-5.4');
-    expect(DEFAULT_CONFIG.llm.gemini?.model).toBe('gemini-3-flash-preview');
-    expect(DEFAULT_CONFIG.llm.ollama?.model).toBe('llama3');
-    expect(DEFAULT_CONFIG.llm.ollama?.base_url).toBe('');
+    // Default config ships empty providers + tiers. Users configure their
+    // own providers via the dashboard / config.yaml.
+    expect(DEFAULT_CONFIG.llm.providers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.tiers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.default).toBeUndefined();
   });
 });
 
@@ -379,6 +391,56 @@ voice:
     process.env.JARVIS_WAKE_ENGINE = 'siri';
     const config = await loadConfig('/tmp/jarvis-voice-invalid-env.yaml');
     expect(config.voice?.wake_engine).toBe('openwakeword');
+  });
+});
+
+describe('Atomic Save', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('leaves no tmp files behind after repeated saves', async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.onboarding = { setup_completed_at: 1, tutorial_completed_at: null };
+    await saveConfig(config, TEST_CONFIG_PATH);
+    config.onboarding = { setup_completed_at: 2, tutorial_completed_at: null };
+    await saveConfig(config, TEST_CONFIG_PATH);
+
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.onboarding?.setup_completed_at).toBe(2);
+    expect(await readdir(TEST_CONFIG_DIR)).toEqual(['config.yaml']);
+  });
+
+  test('concurrent saves never leave a truncated or missing config', async () => {
+    const configs = [1, 2, 3, 4, 5].map((n) => {
+      const c = structuredClone(DEFAULT_CONFIG);
+      c.onboarding = { setup_completed_at: n, tutorial_completed_at: null };
+      return c;
+    });
+    await Promise.all(configs.map((c) => saveConfig(c, TEST_CONFIG_PATH)));
+
+    // Whichever save won, the file must be complete and parseable.
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect([1, 2, 3, 4, 5]).toContain(loaded.onboarding?.setup_completed_at ?? 0);
+    expect(await readdir(TEST_CONFIG_DIR)).toEqual(['config.yaml']);
+  });
+
+  test('refuses to replace a symlinked config and leaves the link intact', async () => {
+    const decoy = join(TEST_CONFIG_DIR, 'decoy.yaml');
+    await Bun.write(decoy, 'daemon:\n  port: 4444\n');
+    await symlink(decoy, TEST_CONFIG_PATH);
+
+    expect(saveConfig(DEFAULT_CONFIG, TEST_CONFIG_PATH)).rejects.toThrow(/symlink/);
+
+    // Neither the link target nor the link itself was touched, and the
+    // rejected tmp file was cleaned up.
+    expect(await Bun.file(decoy).text()).toBe('daemon:\n  port: 4444\n');
+    expect(lstatSync(TEST_CONFIG_PATH).isSymbolicLink()).toBe(true);
+    expect((await readdir(TEST_CONFIG_DIR)).sort()).toEqual(['config.yaml', 'decoy.yaml']);
   });
 });
 

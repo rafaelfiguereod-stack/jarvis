@@ -22,6 +22,7 @@ import { useSpacebarPTT } from "../voice/useSpacebarPTT";
 import { useNotificationCenter } from "../../hooks/useNotificationCenter";
 import { NotificationDrawer } from "../notifications/NotificationDrawer";
 import { LiveDataProvider } from "./LiveDataContext";
+import { PausedTasksBanner } from "./PausedTasksBanner";
 import { useRoomActionDispatcher } from "../rooms/useRoomActionBus";
 import "./AppShell.css";
 
@@ -52,6 +53,7 @@ function objectTypeToRoomKey(t: ObjectType): RoomKey {
     case "tasks":
     case "content":
     case "workspaces":
+    case "usage":
     case "settings":
       return t;
   }
@@ -140,6 +142,7 @@ function AppShellLive() {
       onTTSContainsWake: voice.handleTTSContainsWake,
       onTTSEnd: voice.handleTTSEnd,
       onError: voice.handleError,
+      onRealtimeClosed: voice.handleRealtimeClosed,
     };
   }, [
     live.voiceCallbacksRef,
@@ -148,6 +151,7 @@ function AppShellLive() {
     voice.handleTTSContainsWake,
     voice.handleTTSEnd,
     voice.handleError,
+    voice.handleRealtimeClosed,
   ]);
 
   // Daemon-driven navigation (voice "open workflows" → navigate_room,
@@ -930,6 +934,8 @@ function ShellLayout({
           notificationsSlot={notificationsSlot}
         />
       </div>
+
+      <PausedTasksBanner />
 
       <div className="v2-shell__thread">
         <Thread

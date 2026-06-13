@@ -49,6 +49,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
     - [Stack](#stack)
   - [📖 Documentation](#-documentation)
   - [💬 Community](#-community)
+  - [📊 Telemetry](#-telemetry)
   - [🔒 Security](#-security)
   - [📄 License](#-license)
 
@@ -142,11 +143,10 @@ Run JARVIS on any OS with a single command — no Bun or dependencies required. 
 docker run -d --name jarvis \
   -p 3142:3142 \
   -v jarvis-data:/data \
-  -e JARVIS_API_KEY=sk-ant-your-key \
   ghcr.io/vierisid/jarvis:latest
 ```
 
-The image is available on [GHCR](https://ghcr.io/vierisid/jarvis). Configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume.
+The image is available on [GHCR](https://ghcr.io/vierisid/jarvis). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:3142 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
 
 > **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#️-sidecar-setup) on each machine where you want JARVIS to have desktop awareness and automation capabilities.
 
@@ -391,6 +391,7 @@ General:
 - [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) — LLM provider configuration and routing
 - [docs/VAULT_EXTRACTOR.md](docs/VAULT_EXTRACTOR.md) — Memory and knowledge vault
 - [docs/PERSONALITY_ENGINE.md](docs/PERSONALITY_ENGINE.md) — Personality and role system
+- [docs/TELEMETRY.md](docs/TELEMETRY.md) — What anonymous metrics are collected, and how to opt out
 
 Workflows (contributor reading order):
 
@@ -406,6 +407,30 @@ Workflows (contributor reading order):
 - [Discord](https://discord.gg/ytG2PHQ6rW) — Chat with other users, ask questions, share workflows
 - [Website](https://usejarvis.dev) — Project homepage and documentation
 - [GitHub Issues](https://github.com/vierisid/jarvis/issues) — Bug reports and feature requests
+
+---
+
+## 📊 Telemetry
+
+JARVIS sends **anonymous** usage metrics so the project can measure its unique
+user base and retention. Each ping contains only a hashed machine id (derived
+from hostname + username, never reversible to either), the app version, the
+install method, and the OS/arch. No personal data, config, content, or feature
+usage is ever sent. Pings go out at startup and every hour.
+
+It is on by default (opt-out). Disable it with any of:
+
+```yaml
+# ~/.jarvis/config.yaml
+telemetry:
+  enabled: false
+```
+
+```bash
+JARVIS_TELEMETRY=0   # or the cross-tool standard: DO_NOT_TRACK=1
+```
+
+Full details: [docs/TELEMETRY.md](docs/TELEMETRY.md).
 
 ---
 

@@ -20,7 +20,7 @@ import { WebSocketService } from "./ws-service.ts";
 import { EventReactor } from "./event-reactor.ts";
 import { EventCoalescer } from "./event-coalescer.ts";
 import { CommitmentExecutor } from "./commitment-executor.ts";
-import { checkCommitments, classifyEvent } from "./event-classifier.ts";
+import { classifyEvent } from "./event-classifier.ts";
 import { createApiRoutes, setCorsOrigin } from "./api-routes.ts";
 import { GoogleAuth } from "../integrations/google-auth.ts";
 import { ResearchQueue } from "./research-queue.ts";
@@ -70,7 +70,6 @@ export interface DaemonConfig {
 let shutdownInProgress = false;
 let registry: ServiceRegistry | null = null;
 let healthMonitor: HealthMonitor | null = null;
-let heartbeatTimer: Timer | null = null;
 let commitmentExecutor: CommitmentExecutor | null = null;
 let bgAgent: BackgroundAgentService | null = null;
 let awarenessService: import('../awareness/service.ts').AwarenessService | null = null;
@@ -78,6 +77,7 @@ let goalService: import('../goals/service.ts').GoalService | null = null;
 let workflowWorker: WorkflowWorker | null = null;
 let triggerManager: TriggerManager | null = null;
 let workflowEngineShutdown: (() => Promise<void>) | null = null;
+let systemCron: import('./system-cron.ts').SystemCronService | null = null;
 
 /**
  * Parse command line arguments
@@ -162,10 +162,10 @@ async function handleShutdown(signal: string): Promise<void> {
   console.log(`\n[Daemon] Received ${signal}, shutting down gracefully...`);
 
   try {
-    // Clear heartbeat timer
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
+    // Stop system cron (publishes cron.* events on the shared bus)
+    if (systemCron) {
+      systemCron.stop();
+      systemCron = null;
     }
 
     // Stop commitment executor
@@ -310,6 +310,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     initDatabase(config.dbPath);
     logWithTimestamp('Database initialized successfully');
 
+    // 2.0. Wire LLM usage tracking to the vault DB so every chatTier/streamTier
+    // call appends an llm_usage row. Best-effort: tracking failures never break
+    // the LLM call itself. Pass a resolver so DB reopens are picked up.
+    const { setUsageDatabase } = await import('../llm/usage.ts');
+    const { getDb } = await import('../vault/schema.ts');
+    setUsageDatabase(() => {
+      try { return getDb(); } catch { return null; }
+    });
+
     // 2.1. Add workflow tables (flow / flow_run / flow_version /
     // app_connection / waitpoint / store_entry / workflow_file /
     // workflow_job / trigger_event) to the shared Jarvis DB. Idempotent.
@@ -321,13 +330,24 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const { seedWebappTemplates } = await import('../vault/webapp-template-seeds.ts');
     seedWebappTemplates();
 
-    // 2b. Load LLM settings from DB + encrypted keychain, merge into config
+    // 2b. Load all LLM settings (providers, credentials, single-LLM default,
+    // tiers) from the DB + encrypted keychain. This is the sole source of LLM
+    // config - config.yaml and env vars contribute nothing.
     const { mergeLLMSettingsIntoConfig } = await import('./llm-settings.ts');
     mergeLLMSettingsIntoConfig(jarvisConfig);
     logWithTimestamp('LLM settings loaded from database');
 
     // 3. Create service registry
     registry = new ServiceRegistry();
+
+    // 3b. Anonymous usage telemetry (opt-out). Constructed here so it can be
+    //     registered before the LLM-dependent services and counts installs
+    //     even while the daemon is still in onboarding/setup mode.
+    const { TelemetryService } = await import('../telemetry/index.ts');
+    const telemetryService = new TelemetryService({
+      config: jarvisConfig,
+      packageRoot: path.join(import.meta.dir, '..', '..'),
+    });
 
     // 4. Create proactive modules
     const heartbeatConfig = jarvisConfig.heartbeat;
@@ -376,6 +396,30 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       wsService.broadcastSubAgentProgress(event);
     });
 
+    // 6b'. Phase 4: surface conv-tier task lifecycle events to the UI so it can
+    // render status pills while a delegated task is in flight. No-op when the
+    // user has not configured llm.tiers.conversation (classic orchestrator mode).
+    agentService.setConvTaskEventListener((event) => {
+      // Derive a stable `status` from the event TYPE so it matches what the
+      // event actually represents (the record's mutable `status` field may
+      // have advanced by the time this fires - e.g., a snapshotted
+      // task_started event shouldn't claim status='completed').
+      const statusForEvent =
+        event.type === 'task_started' ? 'running' :
+        event.type === 'task_completed' ? 'completed' :
+        event.type === 'task_failed' ? 'failed' :
+        'cancelled';
+      wsService.broadcastTaskEvent({
+        type: event.type,
+        task_id: event.record.id,
+        template: event.record.request.template,
+        intent: event.record.request.intent,
+        status: statusForEvent,
+        elapsedMs: Date.now() - event.record.startedAt,
+        summary: 'envelope' in event ? event.envelope.summary : undefined,
+      });
+    });
+
     // 6c. Create sidecar manager
     const sidecarManager = new SidecarManager(jarvisConfig.daemon.data_dir.replace('~', os.homedir()));
     // Brain URL precedence: env > config.yaml > default fallback. The loader
@@ -395,6 +439,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // 7. Register services in startup order
     //    Agent first (needs DB), Observers second, Channels third, Sidecar, WebSocket last (needs Agent)
+    registry.register(telemetryService);
     registry.register(agentService);
     if (observerService) registry.register(observerService);
     registry.register(channelService);
@@ -444,6 +489,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const approvalDelivery = new ApprovalDelivery();
     const deferredExecutor = new DeferredExecutor(approvalManager, auditTrail);
     deferredExecutor.setLearner(learner);
+    // Approved actions must respect the kill switch too, not just the gate.
+    deferredExecutor.setEmergencyController(emergencyController);
+    // Inline requests are owned by an authority gate blocked in-process;
+    // any that survived a restart have no gate anymore, so hand them to
+    // the deferred path or approving them would execute nothing.
+    const orphanedInline = approvalManager.demoteAllPendingInline();
+    if (orphanedInline > 0) {
+      console.log(`[Daemon] Demoted ${orphanedInline} orphaned inline approval(s) to deferred`);
+    }
     // Phase 6.3.5b — let WS service resolve approvals from voice intents.
     wsService.setApprovalManager(approvalManager);
     wsService.setDeferredExecutor(deferredExecutor);
@@ -473,6 +527,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const orchestrator = agentService.getOrchestrator();
     orchestrator.setAuthorityEngine(authorityEngine);
     orchestrator.setApprovalManager(approvalManager);
+    // Inline approval execution: the authority gate blocks on the user's
+    // decision and executes the approved tool itself, so results flow back
+    // through the task envelope to the conversation tier.
+    orchestrator.setDeferredExecutor(deferredExecutor);
     orchestrator.setAuditTrail(auditTrail);
     orchestrator.setEmergencyController(emergencyController);
 
@@ -497,10 +555,19 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       if (action === 'approve') {
         const approved = approvalManager.approve(request.id, channel);
         if (!approved) return 'Request already decided';
-        const result = await deferredExecutor.executeApproved(request.id);
+        let reply: string;
+        if (approved.tool_name === 'request_approval' || approved.execution_mode === 'inline') {
+          // Intent-only and inline requests are executed by the blocked
+          // caller (request_approval tool / authority gate) once it sees
+          // the status flip — executing here would run the tool twice.
+          reply = 'Approved. The agent will continue and report back in chat.';
+        } else {
+          const result = await deferredExecutor.executeApproved(request.id);
+          reply = `Approved and executed. Result: ${result.slice(0, 200)}`;
+        }
         const updated = approvalManager.getRequest(request.id);
         if (updated) wsService.broadcastApprovalUpdate(updated);
-        return `Approved and executed. Result: ${result.slice(0, 200)}`;
+        return reply;
       } else {
         const denied = approvalManager.deny(request.id, channel);
         if (!denied) return 'Request already decided';
@@ -564,6 +631,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     sharedEventBus.setObserver((eventType, payload) => {
       workflowEventBuffer.publish(eventType, payload);
     });
+
+    // System cron: publishes `cron.morning` / `cron.evening` / `cron.hourly`
+    // events onto the shared bus. Phase 2 hooks the goal system / commitment
+    // executor / chat-stale watcher onto these so the 15-min heartbeat can
+    // be deleted; for now nothing subscribes and the events are inert.
+    const { SystemCronService } = await import('./system-cron.ts');
+    systemCron = new SystemCronService(sharedEventBus, jarvisConfig.cron);
+    systemCron.start();
 
     // Bootstrap the workflow engine: build/locate the bundle, compile pieces,
     // start the loopback SandboxApi, construct the EngineRuntime, extract the
@@ -856,7 +931,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     deferredExecutor.setResultCallback((requestId, request, result) => {
       // Notify via WS and channels that an approved action was executed.
       // Skip for intent-only approvals — they have no deferred execution.
+      // Skip for inline approvals too: their result returns through the
+      // task loop and the conversation tier verbalizes it, so a raw
+      // notification would duplicate it in the chat.
       if (request.tool_name === 'request_approval') return;
+      if (request.execution_mode === 'inline') return;
       const text = `[EXECUTED] ${request.tool_name}: ${result.slice(0, 200)}`;
       wsService.broadcastNotification(text, 'normal');
     });
@@ -968,6 +1047,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
       // 10d. Wire executor broadcast (needs wsServer running) and start
       executor.setBroadcast((msg) => wsService.getServer().broadcast(msg));
+      executor.setEventBus(sharedEventBus);
       wsService.setCommitmentExecutor(executor);
       executor.start();
       commitmentExecutor = executor;
@@ -1321,7 +1401,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           escalation_weeks: { pressure: 1, root_cause: 3, suggest_kill: 4 },
           auto_decompose: true,
           calendar_ownership: false,
-        });
+        }, sharedEventBus);
         goalSvc.setEventCallback((event) => {
           wsService.broadcastGoalEvent(event);
         });
@@ -1416,83 +1496,30 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // 11. Start health monitoring
     healthMonitor.start(config.healthCheckInterval);
 
-    // 12. Set up heartbeat timer with configurable interval and active hours
-    const heartbeatIntervalMs = (heartbeatConfig?.interval_minutes ?? 15) * 60 * 1000;
-    const activeHours = heartbeatConfig?.active_hours ?? { start: 8, end: 23 };
-
-    console.log(`[Daemon] Heartbeat interval: ${heartbeatConfig?.interval_minutes ?? 15} min, active hours: ${activeHours.start}:00-${activeHours.end}:00`);
-
-    const HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minute timeout for heartbeat
-    let heartbeatBusy = false;
-    heartbeatTimer = setInterval(async () => {
-      if (heartbeatBusy) {
-        console.log('[Daemon] Skipping heartbeat — previous still running');
-        return;
-      }
-      // Check if within active hours
-      const currentHour = new Date().getHours();
-      if (currentHour < activeHours.start || currentHour >= activeHours.end) {
-        console.log(`[Daemon] Outside active hours (${activeHours.start}-${activeHours.end}), skipping heartbeat`);
-        return;
-      }
-
-      heartbeatBusy = true;
-      console.log('[Daemon] Heartbeat starting...');
-      try {
-        // Check commitments and route critical/high ones to reactor
-        const commitmentEvents = checkCommitments();
-        for (const evt of commitmentEvents) {
-          if (evt.priority === 'critical' || evt.priority === 'high') {
-            reactor.react(evt).catch(err =>
-              console.error('[Daemon] Commitment reaction error:', err)
-            );
-          } else {
-            coalescer.addEvent(evt);
-          }
-          // Republish to the workflow event bus so flows with `on_event`
-          // triggers can react. Map the legacy ObserverEvent.type to the
-          // canonical taxonomy.
-          if (evt.event.type === 'commitment_overdue') {
-            sharedEventBus.publish('commitment.overdue', evt.event.data);
-          } else if (evt.event.type === 'commitment_due_soon') {
-            sharedEventBus.publish('commitment.due_soon', evt.event.data);
-          }
-        }
-
-        // Flush coalesced events for heartbeat
-        const coalescedSummary = coalescer.flush();
-
-        // Setup mode = no bgAgent. Skip the heartbeat entirely.
-        if (!bgAgent) {
-          heartbeatBusy = false;
-          return;
-        }
-
-        // Run heartbeat on BACKGROUND agent with timeout to prevent stuck busy lock
-        const heartbeatPromise = bgAgent.handleHeartbeat(
-          coalescedSummary || undefined
-        );
-        const timeoutPromise = new Promise<null>((resolve) =>
-          setTimeout(() => {
-            console.error('[Daemon] Heartbeat timed out after 5 minutes');
-            resolve(null);
-          }, HEARTBEAT_TIMEOUT_MS)
-        );
-
-        const heartbeatResponse = await Promise.race([heartbeatPromise, timeoutPromise]);
-
-        if (heartbeatResponse) {
-          console.log('[Daemon] Heartbeat response:', heartbeatResponse.slice(0, 200));
-          wsService.broadcastHeartbeat(heartbeatResponse);
-        } else {
-          console.log('[Daemon] Heartbeat returned no response (busy or timed out)');
-        }
-      } catch (err) {
-        console.error('[Daemon] Heartbeat error:', err);
-      } finally {
-        heartbeatBusy = false;
-      }
-    }, heartbeatIntervalMs);
+    // 12. The 15-min heartbeat that called bgAgent.handleHeartbeat() has been
+    // deleted. It was the single largest idle LLM cost in the daemon. What
+    // changed for each thing the heartbeat used to do:
+    //   - commitment.overdue / commitment.due_soon workflow events:
+    //       now emitted by CommitmentExecutor on state transitions (one-shot
+    //       per id rather than every 15 min). Better semantics for on_event
+    //       triggers; no behavior change for any current subscriber.
+    //   - EventReactor.react() calls on each commitment event (LLM):
+    //       REMOVED. CommitmentExecutor fires its own MANDATORY execution
+    //       prompt when the cancel deadline elapses, which is the same LLM
+    //       work without the duplicate "react" step the heartbeat added.
+    //   - Coalesced low-priority events flushed to the LLM:
+    //       REMOVED. Observer events still route through the reactor at the
+    //       moment they're classified critical/high; low-priority events no
+    //       longer get a periodic summary digest. EventReactor's per-event
+    //       handling for observer events (file/clipboard/process/etc.)
+    //       continues to work because those paths never went through the
+    //       heartbeat - they were already event-driven.
+    //   - Generic "review your responsibilities" LLM prompt:
+    //       REMOVED. Phase 4 will reintroduce purposeful background work via
+    //       the conversation-tier orchestrator if it proves needed.
+    //
+    // `heartbeatConfig.aggressiveness` is still read by CommitmentExecutor.
+    // `heartbeatConfig.interval_minutes` and `active_hours` are now ignored.
 
     logWithTimestamp(`JARVIS daemon running on port ${config.port}`);
     console.log('');

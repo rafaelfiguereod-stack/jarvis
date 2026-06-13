@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const POLL_INTERVAL_MS = 10000;
 
-export type LLMProvider =
+/**
+ * Provider classes the backend can instantiate. The user names a provider
+ * however they want (the map key in `LLMConfig.providers`); the `kind` field
+ * picks which class to use. Defaults to the map key when omitted.
+ */
+export type LLMProviderKind =
   | "anthropic"
   | "openai"
   | "groq"
@@ -13,7 +18,7 @@ export type LLMProvider =
   | "openai_compatible"
   | "litellm";
 
-export const LLM_PROVIDERS: readonly LLMProvider[] = [
+export const LLM_PROVIDER_KINDS: readonly LLMProviderKind[] = [
   "anthropic",
   "openai",
   "groq",
@@ -25,7 +30,7 @@ export const LLM_PROVIDERS: readonly LLMProvider[] = [
   "litellm",
 ] as const;
 
-export const LLM_PROVIDER_LABELS: Record<LLMProvider, string> = {
+export const LLM_PROVIDER_KIND_LABELS: Record<LLMProviderKind, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
   groq: "Groq",
@@ -37,21 +42,80 @@ export const LLM_PROVIDER_LABELS: Record<LLMProvider, string> = {
   litellm: "LiteLLM",
 };
 
+/**
+ * Provider kinds that authenticate via API key (vs base URL).
+ * Used by the UI to decide which form field to render.
+ */
+export const KEY_BASED_KINDS: ReadonlySet<LLMProviderKind> = new Set([
+  "anthropic",
+  "openai",
+  "groq",
+  "gemini",
+  "openrouter",
+  "nvidia",
+]);
+
+/** Provider kinds that need a base_url. */
+export const URL_BASED_KINDS: ReadonlySet<LLMProviderKind> = new Set([
+  "ollama",
+  "openai_compatible",
+  "litellm",
+]);
+
+/** Tier slot identifiers. */
+export type LLMTier = "conversation" | "high" | "medium" | "low";
+
+/** Backward-compat alias - some legacy components still import LLMProvider. */
+export type LLMProvider = LLMProviderKind;
+export const LLM_PROVIDERS = LLM_PROVIDER_KINDS;
+export const LLM_PROVIDER_LABELS = LLM_PROVIDER_KIND_LABELS;
+
 export type STTProvider = "openai" | "groq" | "sarvam" | "local";
 export type TTSProvider = "edge" | "elevenlabs" | "sarvam";
 
+/**
+ * Per-provider summary returned by GET /api/config/llm. The credential value
+ * (api_key) is never sent to the client - we only expose `has_api_key`. The
+ * `base_url` is visible because it's not a secret.
+ */
+export interface LLMConfigProviderView {
+  kind: LLMProviderKind;
+  has_api_key: boolean;
+  base_url?: string;
+}
+
+/**
+ * Full LLM config snapshot. Two modes:
+ *   - Single-LLM: `default` is set to a "name:model" reference; `tiers` is
+ *     empty. The classic orchestrator runs.
+ *   - Multi-tier: `tiers` has at least one entry. When tiers.conversation is
+ *     set, the router-first architecture activates.
+ *
+ * `mode` is the user's persisted choice of architecture. It's stored
+ * explicitly (not inferred from tier presence) so the selection survives a
+ * tab switch / reload even before any tier model is picked, and so the user
+ * can flip back to single at any time. Runtime routing still keys off tier
+ * presence; `mode` only drives which section the UI shows.
+ */
 export interface LLMConfig {
-  primary: string;
-  fallback: string[];
-  anthropic?: { model: string; has_api_key: boolean } | null;
-  openai?: { model: string; has_api_key: boolean } | null;
-  groq?: { model: string; has_api_key: boolean } | null;
-  gemini?: { model: string; has_api_key: boolean } | null;
-  ollama?: { base_url: string; model: string } | null;
-  openrouter?: { model: string; has_api_key: boolean } | null;
-  nvidia?: { model: string; has_api_key: boolean } | null;
-  openai_compatible?: { base_url: string; model: string; has_api_key: boolean } | null;
-  litellm?: { base_url: string; model: string; has_api_key: boolean } | null;
+  providers: Record<string, LLMConfigProviderView>;
+  default: string | null;
+  mode: "single" | "multi-tier";
+  tiers: {
+    conversation: string | null;
+    high: string | null;
+    medium: string | null;
+    low: string | null;
+  };
+  available_kinds: LLMProviderKind[];
+}
+
+/** Helper: split a "provider:model" reference into its parts. */
+export function parseModelRef(ref: string | null | undefined): { provider: string; model: string } | null {
+  if (!ref || typeof ref !== "string") return null;
+  const idx = ref.indexOf(":");
+  if (idx <= 0 || idx === ref.length - 1) return null;
+  return { provider: ref.slice(0, idx), model: ref.slice(idx + 1) };
 }
 
 export interface ChannelStatus {
@@ -100,6 +164,36 @@ export interface TTSConfig {
   } | null;
 }
 
+export type RealtimeReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface VoiceConfig {
+  wake_engine: string;
+  realtime: {
+    enabled: boolean;
+    model: string;
+    voice: string | null;
+    reasoning_effort: RealtimeReasoningEffort;
+    max_session_minutes: number;
+    monthly_budget_usd: number | null;
+    blocked_categories: string[];
+    /** true when enabled AND the OpenAI provider key resolves. */
+    available: boolean;
+  };
+}
+
+/** Partial patch sent to POST /api/config/voice. */
+export interface VoiceConfigPatch {
+  wake_engine?: string;
+  realtime?: Partial<{
+    enabled: boolean;
+    model: string;
+    voice: string;
+    reasoning_effort: RealtimeReasoningEffort;
+    max_session_minutes: number;
+    monthly_budget_usd: number;
+  }>;
+}
+
 export interface AutostartStatus {
   platform: string;
   manager: string;
@@ -140,7 +234,7 @@ export interface RoleInfo {
     name: string;
     authority_level: number;
     tools: string[];
-    sub_roles: Array<{ role_id: string; name: string; description: string }>;
+    sub_roles?: Array<{ role_id: string; name: string; description: string }>;
   } | null;
 }
 
@@ -239,6 +333,7 @@ export function useSettingsData() {
   const [channelCfg, setChannelCfg] = useState<ChannelConfig | null>(null);
   const [sttCfg, setSTTCfg] = useState<STTConfig | null>(null);
   const [ttsCfg, setTTSCfg] = useState<TTSConfig | null>(null);
+  const [voiceCfg, setVoiceCfg] = useState<VoiceConfig | null>(null);
   const [autostart, setAutostart] = useState<AutostartStatus | null>(null);
   const [rootCfg, setRootCfg] = useState<RootConfig | null>(null);
   const [personality, setPersonality] = useState<PersonalityModel | null>(null);
@@ -260,6 +355,7 @@ export function useSettingsData() {
         chanCfgR,
         sttR,
         ttsR,
+        voiceR,
         autoR,
         rootR,
         persR,
@@ -273,6 +369,7 @@ export function useSettingsData() {
         getJson<ChannelConfig>("/api/config/channels"),
         getJson<STTConfig>("/api/config/stt"),
         getJson<TTSConfig>("/api/config/tts"),
+        getJson<VoiceConfig>("/api/config/voice"),
         getJson<AutostartStatus>("/api/system/autostart"),
         getJson<RootConfig>("/api/config"),
         getJson<PersonalityModel>("/api/personality"),
@@ -286,6 +383,7 @@ export function useSettingsData() {
       if (chanCfgR) setChannelCfg(chanCfgR);
       if (sttR) setSTTCfg(sttR);
       if (ttsR) setTTSCfg(ttsR);
+      if (voiceR) setVoiceCfg(voiceR);
       if (autoR) setAutostart(autoR);
       if (rootR) setRootCfg(rootR);
       if (persR) setPersonality(persR);
@@ -312,11 +410,8 @@ export function useSettingsData() {
   const stats = useMemo(() => {
     let providersWithKey = 0;
     if (llm) {
-      for (const p of LLM_PROVIDERS) {
-        const v = (llm as any)[p];
-        if (!v) continue;
-        // Ollama, OpenAI-compatible, and LiteLLM are "configured" by a base_url, not a key.
-        if (p === "ollama" || p === "openai_compatible" || p === "litellm" || v.has_api_key) {
+      for (const entry of Object.values(llm.providers ?? {})) {
+        if (URL_BASED_KINDS.has(entry.kind) ? entry.base_url : entry.has_api_key) {
           providersWithKey++;
         }
       }
@@ -336,15 +431,20 @@ export function useSettingsData() {
   }, [llm, channelCfg, ttsCfg, sidecars, restartPending]);
 
   // ── LLM actions (hot-reloaded) ──────────────────────────────────────
-  const setPrimaryLLM = useCallback(
-    async (provider: LLMProvider): Promise<ActionResult> => {
+
+  /** Add/update a provider entry. Partial fields are merged with existing. */
+  const upsertProvider = useCallback(
+    async (
+      name: string,
+      input: { kind?: LLMProviderKind; api_key?: string; base_url?: string },
+    ): Promise<ActionResult> => {
       try {
         const r = await postJson<{ ok: boolean; message: string }>(
           "/api/config/llm",
-          { primary: provider },
+          { providers: { [name]: input } },
         );
         await refresh();
-        return { ok: true, message: r.message || `Primary set to ${LLM_PROVIDER_LABELS[provider]}.` };
+        return { ok: true, message: r.message || `Provider '${name}' saved.` };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -352,15 +452,16 @@ export function useSettingsData() {
     [refresh],
   );
 
-  const setFallbackLLM = useCallback(
-    async (fallback: string[]): Promise<ActionResult> => {
+  /** Remove a provider entry entirely. */
+  const removeProvider = useCallback(
+    async (name: string): Promise<ActionResult> => {
       try {
         const r = await postJson<{ ok: boolean; message: string }>(
           "/api/config/llm",
-          { fallback },
+          { providers: { [name]: null } },
         );
         await refresh();
-        return { ok: true, message: r.message || `Fallback updated.` };
+        return { ok: true, message: r.message || `Provider '${name}' removed.` };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -368,16 +469,19 @@ export function useSettingsData() {
     [refresh],
   );
 
-  const setLLMModel = useCallback(
-    async (provider: LLMProvider, model: string): Promise<ActionResult> => {
+  /** Set or clear the single-LLM default model. `null` clears it. */
+  const setDefaultModel = useCallback(
+    async (ref: string | null): Promise<ActionResult> => {
       try {
-        const body: Record<string, unknown> = { [provider]: { model } };
         const r = await postJson<{ ok: boolean; message: string }>(
           "/api/config/llm",
-          body,
+          { default: ref },
         );
         await refresh();
-        return { ok: true, message: r.message || `${LLM_PROVIDER_LABELS[provider]} model set to ${model}.` };
+        return {
+          ok: true,
+          message: r.message || (ref ? `Default model set to ${ref}.` : "Default model cleared."),
+        };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -385,63 +489,19 @@ export function useSettingsData() {
     [refresh],
   );
 
-  const setLLMApiKey = useCallback(
-    async (provider: LLMProvider, apiKey: string): Promise<ActionResult> => {
+  /** Set or clear a tier's model. `null` clears the tier. */
+  const setTierModel = useCallback(
+    async (tier: LLMTier, ref: string | null): Promise<ActionResult> => {
       try {
         const r = await postJson<{ ok: boolean; message: string }>(
           "/api/config/llm",
-          { [provider]: { api_key: apiKey } },
+          { tiers: { [tier]: ref } },
         );
         await refresh();
-        return { ok: true, message: r.message || `${LLM_PROVIDER_LABELS[provider]} key saved.` };
-      } catch (err) {
-        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
-      }
-    },
-    [refresh],
-  );
-
-  const setOllamaBaseUrl = useCallback(
-    async (baseUrl: string): Promise<ActionResult> => {
-      try {
-        const r = await postJson<{ ok: boolean; message: string }>(
-          "/api/config/llm",
-          { ollama: { base_url: baseUrl } },
-        );
-        await refresh();
-        return { ok: true, message: r.message || `Ollama base URL updated.` };
-      } catch (err) {
-        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
-      }
-    },
-    [refresh],
-  );
-
-  const setLiteLLMBaseUrl = useCallback(
-    async (baseUrl: string): Promise<ActionResult> => {
-      try {
-        const r = await postJson<{ ok: boolean; message: string }>(
-          "/api/config/llm",
-          { litellm: { base_url: baseUrl } },
-        );
-        await refresh();
-        return { ok: true, message: r.message || "LiteLLM base URL updated." };
-      } catch (err) {
-        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
-      }
-    },
-    [refresh],
-  );
-
-  const setOpenAICompatibleBaseUrl = useCallback(
-    async (baseUrl: string): Promise<ActionResult> => {
-      try {
-        const r = await postJson<{ ok: boolean; message: string }>(
-          "/api/config/llm",
-          { openai_compatible: { base_url: baseUrl } },
-        );
-        await refresh();
-        return { ok: true, message: r.message || "OpenAI-compatible base URL updated." };
+        return {
+          ok: true,
+          message: r.message || (ref ? `${tier} tier set to ${ref}.` : `${tier} tier cleared.`),
+        };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -450,19 +510,71 @@ export function useSettingsData() {
   );
 
   /**
-   * Test a provider's connection. Accepts optional `model` / `baseUrl`
-   * overrides so the UI can test what's currently in the textbox before
-   * the user clicks Save. Without overrides the server falls back to the
-   * stored config -- which would test the OLD model after the user typed
-   * a new one but hadn't saved yet.
+   * Clear every tier slot in a single request. Used by the LLM mode-switch
+   * (multi-tier -> single LLM) so the transition is atomic from the user's
+   * perspective: one button click, one network round-trip, one refresh.
+   */
+  const clearAllTiers = useCallback(async (): Promise<ActionResult> => {
+    try {
+      const r = await postJson<{ ok: boolean; message: string }>(
+        "/api/config/llm",
+        { tiers: { conversation: null, high: null, medium: null, low: null } },
+      );
+      await refresh();
+      return { ok: true, message: r.message || "All tiers cleared." };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+    }
+  }, [refresh]);
+
+  /**
+   * Switch the persisted LLM architecture mode. The choice is stored on the
+   * backend so it survives reloads and the user can flip either direction at
+   * any time. Switching to single also clears every tier in the same request
+   * (atomic from the user's perspective) so router-first stays off and there's
+   * no stale tier config left behind.
+   */
+  const setLLMMode = useCallback(
+    async (mode: "single" | "multi-tier"): Promise<ActionResult> => {
+      try {
+        const body =
+          mode === "single"
+            ? { mode, tiers: { conversation: null, high: null, medium: null, low: null } }
+            : { mode };
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/llm",
+          body,
+        );
+        await refresh();
+        return {
+          ok: true,
+          message:
+            r.message ||
+            (mode === "single"
+              ? "Switched to single-LLM mode (tier config cleared)."
+              : "Switched to multi-tier mode."),
+        };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [refresh],
+  );
+
+  /**
+   * Test a provider's credentials. The `name` is the user's chosen provider
+   * key (e.g. "anthropic" or "ollama-remote"). Optional overrides let the UI
+   * test what's in a form field before the user clicks Save - without them,
+   * the server uses currently-stored credentials.
    */
   const testProvider = useCallback(
     async (
-      provider: LLMProvider,
-      overrides?: { model?: string; baseUrl?: string; apiKey?: string },
+      name: string,
+      overrides?: { kind?: LLMProviderKind; model?: string; baseUrl?: string; apiKey?: string },
     ): Promise<ActionResult> => {
       try {
-        const body: Record<string, unknown> = { provider };
+        const body: Record<string, unknown> = { name };
+        if (overrides?.kind) body.kind = overrides.kind;
         if (overrides?.model) body.model = overrides.model;
         if (overrides?.baseUrl) body.base_url = overrides.baseUrl;
         if (overrides?.apiKey) body.api_key = overrides.apiKey;
@@ -471,7 +583,7 @@ export function useSettingsData() {
           body,
         );
         if (r.ok) {
-          return { ok: true, message: `${LLM_PROVIDER_LABELS[provider]}: ${r.model ?? "connected"}.` };
+          return { ok: true, message: `${name}: ${r.model ?? "connected"}.` };
         }
         return { ok: false, message: r.error ?? "Test failed." };
       } catch (err) {
@@ -596,6 +708,23 @@ export function useSettingsData() {
       }
     },
     [refresh, ttsCfg],
+  );
+
+  // ── Voice / Premium realtime (config write — /api/config/voice) ─────
+  const setVoiceConfig = useCallback(
+    async (patch: VoiceConfigPatch): Promise<ActionResult> => {
+      try {
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/voice",
+          patch,
+        );
+        await refresh();
+        return { ok: true, message: r.message || "Voice settings saved." };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [refresh],
   );
 
   // ── Heartbeat (config write — root /api/config) ─────────────────────
@@ -762,6 +891,7 @@ export function useSettingsData() {
     channelCfg,
     sttCfg,
     ttsCfg,
+    voiceCfg,
     autostart,
     rootCfg,
     personality,
@@ -778,18 +908,19 @@ export function useSettingsData() {
 
     // actions
     refresh,
-    setPrimaryLLM,
-    setFallbackLLM,
-    setLLMModel,
-    setLLMApiKey,
-    setOllamaBaseUrl,
-    setOpenAICompatibleBaseUrl,
-    setLiteLLMBaseUrl,
+    // New-shape LLM actions
+    upsertProvider,
+    removeProvider,
+    setDefaultModel,
+    setTierModel,
+    clearAllTiers,
+    setLLMMode,
     testProvider,
     setTelegram,
     setDiscord,
     setSTTProvider,
     setTTS,
+    setVoiceConfig,
     setHeartbeatInterval,
     setHeartbeatAggressiveness,
     restartDaemon,

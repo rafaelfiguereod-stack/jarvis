@@ -362,6 +362,11 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_agent ON approval_requests(agent_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_category ON approval_requests(action_category)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_created ON approval_requests(created_at)`);
+  // Migration: 'inline' requests are executed by the authority gate that is
+  // blocked waiting on them (result flows back to the conversation); the
+  // approve endpoints only flip the status. 'deferred' keeps the legacy
+  // execute-on-approve behavior.
+  try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'deferred'`); } catch {}
 
   // Authority: Audit trail
   db.run(`
@@ -745,4 +750,51 @@ function createTables(db: Database): void {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_agent_id ON agent_activity(agent_id, timestamp DESC)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_timestamp ON agent_activity(timestamp DESC)`);
+
+  // LLM usage tracking: every chatTier/streamTier call appends one row so
+  // future cost analysis can attribute consumption to a subsystem (chat,
+  // heartbeat, voice_intent, extractor, suggestion_engine, ...) on a given
+  // tier and model. No caps or enforcement at this layer.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS llm_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      tier TEXT NOT NULL,
+      resolved_tier TEXT NOT NULL,
+      subsystem TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      latency_ms INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_subsystem ON llm_usage(subsystem, ts DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_tier ON llm_usage(tier, ts DESC)`);
+
+  // Conv-tier delegated tasks. The TaskRegistry mirrors mutations here so
+  // paused (needs_input) tasks survive daemon restarts: the user's eventual
+  // clarification reply can still resume the saved conversation buffer. Tasks
+  // that were mid-flight (running/queued) at shutdown are reconciled to
+  // failed on boot because the LLM call doesn't survive a process restart.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      template TEXT NOT NULL,
+      intent TEXT NOT NULL,
+      original_message TEXT,
+      subsystem TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      result_json TEXT,
+      question TEXT,
+      paused_conversation TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC)`);
 }

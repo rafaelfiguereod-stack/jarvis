@@ -1,6 +1,7 @@
 import YAML from 'yaml';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { lstat, rename, unlink } from 'node:fs/promises';
 import type { JarvisConfig } from './types.ts';
 import { DEFAULT_CONFIG } from './types.ts';
 import { secureParentDirectory, secureWriteFile } from '../util/fs-secure.ts';
@@ -63,41 +64,10 @@ function applyEnvOverrides(config: JarvisConfig): void {
     config.daemon.db_path = join(home, 'jarvis.db');
   }
 
-  if (env.JARVIS_API_KEY) {
-    if (!config.llm.anthropic) config.llm.anthropic = { api_key: '', model: 'claude-sonnet-4-5-20250929' };
-    config.llm.anthropic.api_key = env.JARVIS_API_KEY;
-  }
-
-  if (env.JARVIS_OPENAI_KEY) {
-    if (!config.llm.openai) config.llm.openai = { api_key: '', model: 'gpt-4o' };
-    config.llm.openai.api_key = env.JARVIS_OPENAI_KEY;
-  }
-
-  if (env.JARVIS_GROQ_KEY) {
-    if (!config.llm.groq) config.llm.groq = { api_key: '', model: 'llama-3.3-70b-versatile' };
-    config.llm.groq.api_key = env.JARVIS_GROQ_KEY;
-  }
-
-  if (env.JARVIS_OLLAMA_URL) {
-    if (!config.llm.ollama) config.llm.ollama = { base_url: '', model: 'llama3' };
-    config.llm.ollama.base_url = env.JARVIS_OLLAMA_URL;
-  }
-
-  if (env.JARVIS_OPENROUTER_KEY) {
-    if (!config.llm.openrouter) config.llm.openrouter = { api_key: '', model: 'anthropic/claude-sonnet-4' };
-    config.llm.openrouter.api_key = env.JARVIS_OPENROUTER_KEY;
-  }
-
-  if (env.NVIDIA_API_KEY) {
-    if (!config.llm.nvidia) config.llm.nvidia = { api_key: '', model: 'meta/llama-3.3-70b-instruct' };
-    config.llm.nvidia.api_key = env.NVIDIA_API_KEY;
-  }
-
-  if (env.JARVIS_LITELLM_URL || env.JARVIS_LITELLM_KEY) {
-    if (!config.llm.litellm) config.llm.litellm = { base_url: 'http://localhost:4000/v1', api_key: '', model: '' };
-    if (env.JARVIS_LITELLM_URL) config.llm.litellm.base_url = env.JARVIS_LITELLM_URL;
-    if (env.JARVIS_LITELLM_KEY) config.llm.litellm.api_key = env.JARVIS_LITELLM_KEY;
-  }
+  // NOTE: LLM provider configuration is intentionally NOT read from env vars.
+  // Providers, credentials, the single-LLM default, and tiers live exclusively
+  // in the database + encrypted keychain and are managed from the settings
+  // dashboard. There is no env or config.yaml path for LLM config.
 
   if (env.JARVIS_BRAIN_DOMAIN) {
     config.daemon.brain_domain = env.JARVIS_BRAIN_DOMAIN;
@@ -116,6 +86,15 @@ function applyEnvOverrides(config: JarvisConfig): void {
     } else {
       console.warn(`[Config] Invalid JARVIS_WAKE_ENGINE="${engine}" — must be openwakeword|webspeech|auto; ignoring.`);
     }
+  }
+
+  // Premium realtime voice (gpt-realtime-2). Truthy values enable; "0"/"false"
+  // explicitly disable. See docs/GPT_REALTIME_2_INTEGRATION.md.
+  if (env.JARVIS_REALTIME_VOICE !== undefined) {
+    if (!config.voice) config.voice = { wake_engine: 'openwakeword' };
+    if (!config.voice.realtime) config.voice.realtime = { enabled: false };
+    const v = env.JARVIS_REALTIME_VOICE.trim().toLowerCase();
+    config.voice.realtime.enabled = v !== '' && v !== '0' && v !== 'false' && v !== 'no';
   }
 }
 
@@ -160,8 +139,33 @@ export async function loadConfig(configPath?: string): Promise<JarvisConfig> {
   // Apply environment variable overrides
   applyEnvOverrides(config);
 
+  // LLM configuration is owned exclusively by the DB + keychain (dashboard).
+  // config.yaml has NO authority over any LLM setting, so discard anything the
+  // file contributed and start from the empty default - the runtime tier map,
+  // providers, and default are loaded from the DB by mergeLLMSettingsIntoConfig
+  // at daemon startup.
+  config.llm = structuredClone(DEFAULT_CONFIG.llm);
+
   return config;
 }
+
+/**
+ * Strip the ENTIRE `llm` block before writing config.yaml.
+ *
+ * LLM configuration (providers, credentials, single-LLM default, tiers) lives
+ * exclusively in the database + encrypted keychain and is managed from the
+ * settings dashboard. config.yaml has no authority over any LLM setting, so it
+ * must never carry one - dropping the block here also self-heals any stale
+ * `llm:` section left over from older installs on the next save.
+ */
+function stripLLMConfigForYAML(config: JarvisConfig): JarvisConfig {
+  const clone = structuredClone(config);
+  delete (clone as { llm?: unknown }).llm;
+  return clone;
+}
+
+/** Monotonic per-process counter for unique save temp-file names. */
+let saveCounter = 0;
 
 export async function saveConfig(
   config: JarvisConfig,
@@ -170,7 +174,8 @@ export async function saveConfig(
   const path = configPath || expandTilde('~/.jarvis/config.yaml');
 
   try {
-    const yaml = YAML.stringify(config, {
+    const canonical = stripLLMConfigForYAML(config);
+    const yaml = YAML.stringify(canonical, {
       indent: 2,
       lineWidth: 100,
       defaultStringType: 'PLAIN',
@@ -178,7 +183,34 @@ export async function saveConfig(
     });
 
     await secureParentDirectory(path);
-    await secureWriteFile(path, yaml, 0o600, 'Config');
+    // Write-then-rename so the config is replaced atomically. A direct
+    // O_TRUNC write leaves a truncated/empty config.yaml if the daemon is
+    // killed mid-write -- on the next boot that parses as defaults and the
+    // user loses onboarding state, authority overrides, everything.
+    // The tmp name carries pid + a counter so two concurrent saves can
+    // never rename each other's half-written file into place.
+    const tmpPath = `${path}.${process.pid}.${saveCounter++}.tmp`;
+    await secureWriteFile(tmpPath, yaml, 0o600, 'Config');
+
+    // rename() would silently replace a symlinked config.yaml with a
+    // regular file (e.g. a link into a dotfiles repo). secureWriteFile
+    // refuses symlinks via O_NOFOLLOW; keep that contract here and fail
+    // loudly instead of clobbering the link.
+    const existing = await lstat(path).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      await unlink(tmpPath).catch(() => {});
+      throw new Error(`${path} is a symlink; refusing to replace it`);
+    }
+
+    try {
+      await rename(tmpPath, path);
+    } catch {
+      // Rename across-the-board works on POSIX; on Windows it can fail
+      // transiently (antivirus holding the target). Fall back to the
+      // in-place write rather than losing the save entirely.
+      await unlink(tmpPath).catch(() => {});
+      await secureWriteFile(path, yaml, 0o600, 'Config');
+    }
     console.log(`Config saved to ${path}`);
   } catch (err) {
     throw new Error(`Failed to save config to ${path}: ${err}`);

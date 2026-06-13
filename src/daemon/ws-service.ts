@@ -6,6 +6,8 @@
  */
 
 import type { ServerWebSocket } from 'bun';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { Service, ServiceStatus } from './services.ts';
 import type { AgentService } from './agent-service.ts';
 import type { CommitmentExecutor } from './commitment-executor.ts';
@@ -36,6 +38,11 @@ import { createCommitment, updateCommitmentStatus, updateCommitmentAssignee } fr
 import { recordAgentActivity } from '../vault/agent-activity.ts';
 import { WebSocketServer, type WSMessage } from '../comms/websocket.ts';
 import { StreamRelay } from '../comms/streaming.ts';
+import { resolveRealtimeVoice, type ResolvedRealtimeVoice } from '../config/realtime.ts';
+import { BrowserAudioTransport } from '../comms/audio-transport.ts';
+import { RealtimeVoiceSession } from './realtime-voice.ts';
+import { REALTIME_NAV_TOOLS, REALTIME_NAV_TOOL_NAMES } from './realtime-nav-tools.ts';
+import { RealtimeBudgetTracker } from './realtime-budget.ts';
 import { classifyErrorString } from '../llm/provider.ts';
 import { getOrCreateConversation, addMessage } from '../vault/conversations.ts';
 import { maybeCreateUserProfileFollowupPrompt, recordUserProfileTurn } from '../user/profile-followup.ts';
@@ -143,6 +150,22 @@ export class WebSocketService implements Service {
   private sttProvider: STTProvider | null = null;
   private voiceSessions = new Map<ServerWebSocket<unknown>, VoiceSession>();
   private pendingVoiceConfirmations = new Map<string, PendingVoiceConfirmation>();
+  /**
+   * Premium realtime voice (gpt-realtime-2) sessions, keyed by socket. Present
+   * only when `voice.realtime.enabled` resolves with a key. A realtime session
+   * owns the full duplex audio loop (STT+LLM+TTS in one OpenAI connection), so
+   * the socket's normal `voiceSessions` accumulator is bypassed while it lives.
+   */
+  private realtimeSessions = new Map<
+    ServerWebSocket<unknown>,
+    { session: RealtimeVoiceSession; transport: BrowserAudioTransport; timeout: ReturnType<typeof setTimeout>; startedAt: number }
+  >();
+  /**
+   * Lazily-created monthly spend guard for realtime voice. Only used when a
+   * `monthly_budget_usd` is configured; persists to the daemon data dir so the
+   * cap survives restarts. See realtime-budget.ts.
+   */
+  private realtimeBudget: RealtimeBudgetTracker | null = null;
   /**
    * Phase B — per-WS onboarding interview sessions. Created on
    * `interview_start`, torn down on disconnect or after the agent
@@ -297,6 +320,8 @@ export class WebSocketService implements Service {
           console.log('[WSService] Client connected');
         },
         onDisconnect: (ws) => {
+          // Tear down any realtime voice session (closes the OpenAI WS + timer).
+          this.closeRealtimeVoice(ws);
           // Clean up every per-socket map so a long-running daemon doesn't
           // accumulate dead-socket entries across reconnects. See
           // cleanupPerSocketMaps for the contract; tested in
@@ -673,6 +698,36 @@ export class WebSocketService implements Service {
   }
 
   /**
+   * Broadcast a conv-tier task lifecycle event to all connected clients. The
+   * UI uses these to render status pills like `[research running - 14s]`
+   * while a delegated task is in flight, and to flash a "result ready" hint
+   * when the task completes after the user has moved on.
+   *
+   * Full payload contract + consumer example: see the `task_event` comment
+   * on `WSMessage` in `src/comms/websocket.ts`. Briefly:
+   *   - task_started: show/update a pill for this task_id
+   *   - task_completed/failed/cancelled: remove the pill, show summary
+   *   - task_started CAN fire again on the same task_id when a paused task
+   *     resumes (after the conv LLM provided a clarification reply)
+   */
+  broadcastTaskEvent(event: {
+    type: 'task_started' | 'task_completed' | 'task_failed' | 'task_cancelled';
+    task_id: string;
+    template: string;
+    intent: string;
+    status: string;
+    elapsedMs: number;
+    summary?: string;
+  }): void {
+    const message: WSMessage = {
+      type: 'task_event',
+      payload: event,
+      timestamp: Date.now(),
+    };
+    this.wsServer.broadcast(message);
+  }
+
+  /**
    * Format a FileEntry tree into a compact text listing.
    */
   private formatFileTree(entry: { name: string; path: string; type: 'file' | 'directory'; children?: { name: string; type: 'file' | 'directory' }[] }): string {
@@ -715,6 +770,9 @@ export class WebSocketService implements Service {
 
       case 'voice_start': {
         const { requestId, currentRoom } = msg.payload as { requestId: string; currentRoom?: string };
+        // Premium path: if realtime voice is enabled + keyed, open (or reuse) a
+        // full-duplex realtime session and skip the STT accumulator entirely.
+        if (this.tryStartRealtimeVoice(ws)) return undefined;
         this.voiceSessions.set(ws, {
           requestId,
           chunks: [],
@@ -1130,6 +1188,14 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         }
       }
 
+      // If StreamRelay already broadcast the error to all clients (including
+      // this requester), don't emit a second error WSMessage as the handler
+      // return value - the user would see the same error twice.
+      const broadcastFlag = (error as Error & { _streamErrorBroadcast?: boolean })?._streamErrorBroadcast;
+      if (broadcastFlag) {
+        return undefined;
+      }
+
       const message = error instanceof Error ? error.message : 'Chat processing failed';
       return {
         type: 'error',
@@ -1148,12 +1214,189 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
    * Accumulates chunks into the active voice session for this client.
    */
   private async handleVoiceAudio(data: Buffer, ws: ServerWebSocket<unknown>): Promise<void> {
+    // Realtime path: stream the mic frame straight into the OpenAI session.
+    const realtime = this.realtimeSessions.get(ws);
+    if (realtime) {
+      realtime.transport.pushMicChunk(data);
+      return;
+    }
     const session = this.voiceSessions.get(ws);
     if (!session) {
       console.warn('[WSService] Binary audio received with no active voice session');
       return;
     }
     session.chunks.push(data);
+  }
+
+  /**
+   * Open (or reuse) a premium realtime voice session for this socket. Returns
+   * true if realtime handled the `voice_start` (so the caller skips the normal
+   * STT accumulator), false if realtime is disabled/unavailable.
+   *
+   * A single session spans the conversation: `voice_end` is a no-op for
+   * realtime (OpenAI's semantic VAD detects turns), and the session is closed
+   * on disconnect or after `max_session_minutes` (cost guard).
+   */
+  private tryStartRealtimeVoice(ws: ServerWebSocket<unknown>): boolean {
+    if (this.realtimeSessions.has(ws)) return true; // already streaming
+
+    let resolved: ResolvedRealtimeVoice;
+    try {
+      const res = resolveRealtimeVoice(this.agentService.getConfig());
+      if (!res.ok) return false;
+      resolved = res.resolved;
+    } catch (err) {
+      console.warn('[WSService] realtime voice resolve failed, using standard pipeline:', err);
+      return false;
+    }
+
+    // Monthly spend guard: refuse new sessions once the estimated budget is
+    // hit. Returns true (caller skips the standard accumulator) but opens no
+    // session. Sent as `closed` (not `error`) + a message so the client stops
+    // the mic via the normal close path and surfaces the reason, rather than a
+    // bare error flash. Falling through to the standard pipeline would be wrong:
+    // the client is already streaming raw realtime PCM, which the WAV-based path
+    // can't consume.
+    if (resolved.monthlyBudgetUsd && !this.getRealtimeBudget().canStart(resolved.monthlyBudgetUsd)) {
+      console.warn('[WSService] realtime monthly budget reached — refusing new session');
+      this.wsServer.sendToClient(ws, {
+        type: 'realtime_status',
+        payload: {
+          state: 'closed',
+          reason: 'budget',
+          message: `Monthly realtime voice budget ($${resolved.monthlyBudgetUsd}) reached. Voice is paused until next month or until you raise the limit in Settings > Voice.`,
+        },
+        timestamp: Date.now(),
+      });
+      return true;
+    }
+
+    const orchestrator = this.agentService.getOrchestrator();
+    const transport = new BrowserAudioTransport({
+      sendAudio: (chunk) => this.wsServer.sendBinary(ws, chunk),
+      signalStopPlayback: () =>
+        this.wsServer.sendToClient(ws, { type: 'tts_end', payload: { bargeIn: true }, timestamp: Date.now() }),
+      // OpenAI requires input rate >= 24kHz; the browser client must capture/
+      // resample to this. Output is also 24kHz PCM.
+      inputSampleRate: 24000,
+      outputSampleRate: 24000,
+    });
+
+    const session = new RealtimeVoiceSession(resolved, transport, {
+      // Agent tools + dashboard navigation/in-room-action tools so the model
+      // can drive the UI by voice (open settings, turn off TTS, go back…).
+      tools: [...orchestrator.getRealtimeTools(), ...REALTIME_NAV_TOOLS],
+      // Lean voice prompt (~100 tokens) instead of the full ~5.6k-token agent
+      // prompt — the big context was the dominant per-turn latency for simple
+      // questions. Tools stay, so capability is unchanged. See agent-service.
+      instructions: this.agentService.buildRealtimeVoiceInstructions(),
+      executeToolCall: (name, args) => {
+        // Dashboard nav/in-room actions are handled here (they broadcast to the
+        // dashboard); everything else goes through the auto-approve tool bridge.
+        const nav = this.executeRealtimeNavTool(name, args);
+        if (nav !== null) return Promise.resolve(nav);
+        return orchestrator.executeRealtimeToolCall(name, args, { blockedCategories: resolved.blockedCategories });
+      },
+      onTranscript: (t) =>
+        this.wsServer.sendToClient(ws, {
+          type: 'realtime_transcript',
+          payload: { role: t.role, text: t.text, final: t.final },
+          timestamp: Date.now(),
+        }),
+      onError: (err) => {
+        console.error('[WSService] realtime voice error:', err);
+        this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'error', message: err }, timestamp: Date.now() });
+      },
+      onClose: () => this.closeRealtimeVoice(ws),
+    });
+
+    const timeout = setTimeout(() => {
+      console.log('[WSService] realtime session hit max_session_minutes, closing');
+      this.closeRealtimeVoice(ws);
+    }, resolved.maxSessionMinutes * 60_000);
+
+    this.realtimeSessions.set(ws, { session, transport, timeout, startedAt: Date.now() });
+    session.connect().then(
+      () => this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'live', model: resolved.model }, timestamp: Date.now() }),
+      (err) => {
+        console.error('[WSService] realtime connect failed:', err);
+        this.closeRealtimeVoice(ws);
+      },
+    );
+    return true;
+  }
+
+  /**
+   * Execute a dashboard navigation / in-room-action tool called by the realtime
+   * voice model. Returns a short result string for the model to acknowledge, or
+   * null if `name` isn't a navigation tool (so the caller falls through to the
+   * normal tool bridge). Reuses the same broadcast* methods the standard voice
+   * path uses, so the dashboard reacts identically.
+   */
+  private executeRealtimeNavTool(name: string, args: Record<string, unknown>): string | null {
+    if (!REALTIME_NAV_TOOL_NAMES.has(name)) return null;
+    const reqId = crypto.randomUUID();
+    switch (name) {
+      case 'open_dashboard_room': {
+        const room = String(args.room ?? '');
+        if (!room) return 'No room specified.';
+        this.broadcastRoomNavigation(room as RoomKey, reqId);
+        return `Opened the ${room} room.`;
+      }
+      case 'go_back_to_thread': {
+        this.broadcastNavigateHome(reqId);
+        return 'Back to the thread.';
+      }
+      case 'control_dashboard_window': {
+        const action = String(args.action ?? '');
+        const target = (args.target ? String(args.target) : 'most_recent') as RoomKey | 'most_recent';
+        if (!action) return 'No window action specified.';
+        this.broadcastWindowControl({ action: action as WindowControl['action'], target }, reqId);
+        return `${action} done.`;
+      }
+      case 'dashboard_room_action': {
+        const room = String(args.room ?? '');
+        const action = String(args.action ?? '');
+        if (!room || !action) return 'Room and action are required.';
+        const innerArgs = (args.args && typeof args.args === 'object') ? args.args as Record<string, unknown> : {};
+        // Auto-open the room first (no-op if already open), then dispatch —
+        // mirrors the classifier path so the qualifier isn't dropped.
+        this.broadcastRoomNavigation(room as RoomKey, reqId);
+        this.broadcastRoomAction({ room, action, args: innerArgs }, reqId);
+        return `Done: ${action} in ${room}.`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** Lazily build the monthly spend tracker, persisted under the data dir. */
+  private getRealtimeBudget(): RealtimeBudgetTracker {
+    if (!this.realtimeBudget) {
+      const dataDir = this.agentService.getConfig().daemon?.data_dir || join(homedir(), '.jarvis');
+      this.realtimeBudget = RealtimeBudgetTracker.fromFile(join(dataDir, 'realtime-budget.json'));
+    }
+    return this.realtimeBudget;
+  }
+
+  /** Tear down a realtime voice session and notify the client. */
+  private closeRealtimeVoice(ws: ServerWebSocket<unknown>): void {
+    const entry = this.realtimeSessions.get(ws);
+    if (!entry) return;
+    this.realtimeSessions.delete(ws);
+    clearTimeout(entry.timeout);
+    // Record estimated spend against the monthly budget (only meaningful when a
+    // budget is set; recording always is cheap and keeps the cap honest if one
+    // is added mid-month).
+    try {
+      this.getRealtimeBudget().recordSessionSeconds((Date.now() - entry.startedAt) / 1000);
+    } catch (err) {
+      console.warn('[WSService] failed to record realtime spend:', err);
+    }
+    try { entry.session.close(); } catch { /* ignore */ }
+    try {
+      this.wsServer.sendToClient(ws, { type: 'realtime_status', payload: { state: 'closed' }, timestamp: Date.now() });
+    } catch { /* socket may already be gone */ }
   }
 
   /**
@@ -1191,7 +1434,10 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     }
 
     const llm = this.agentService.getLLMManager();
-    if (!llm.getProvider(this.agentService.getConfig().llm.primary)) {
+    // Just check that at least one provider is registered. The interviewer
+    // routes through llm.chatTier internally which resolves through the
+    // configured default/tiers.
+    if (llm.getProviderNames().length === 0) {
       this.wsServer.sendToClient(ws, {
         type: 'interview_error',
         payload: { message: 'No LLM configured. Finish setup first.' },
@@ -1215,6 +1461,13 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
 
     const text = result.assistantText.trim();
 
+    // Decide up-front whether audio will follow, and TELL the UI in the
+    // text message. The UI must not guess: when it assumed TTS based on
+    // its own (possibly stale) settings fetch and no `tts_start` ever
+    // arrived — e.g. TTS disabled, or no provider loaded — it sat in
+    // "Jarvis is thinking…" forever with the composer disabled.
+    const willSpeak = Boolean(speakReply && this.ttsProvider && text);
+
     // Send the text reply for the UI to render in the chat-bubble
     // layout (always — the bubble is the visual record even when TTS
     // is on).
@@ -1224,16 +1477,21 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
         text,
         facts_recorded: result.factsRecorded,
         done: result.done,
+        will_speak: willSpeak,
       },
       timestamp: Date.now(),
     });
 
-    // If TTS is on AND the user wants the reply spoken AND we have a
-    // provider loaded, stream the audio. Reuse the existing
-    // `tts_start` + binary chunks pipeline so the UI's MicOrb plays
-    // it through the normal "speaking" state machine.
-    if (speakReply && this.ttsProvider && text) {
+    // Stream the audio via the existing `tts_start` + binary chunks
+    // pipeline so the UI's MicOrb plays it through the normal
+    // "speaking" state machine.
+    if (willSpeak && this.ttsProvider) {
       const requestId = `interview-${Date.now()}`;
+      // Tracks whether the tts_start frame went out: the finally block
+      // below closes it with tts_end exactly when it was opened, so a
+      // provider that throws -- even before the first chunk -- never
+      // strands the UI in "speaking" with no audio and no tts_end.
+      let ttsStarted = false;
       try {
         this.wsServer.sendToClient(ws, {
           type: 'tts_start',
@@ -1244,17 +1502,23 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
           id: requestId,
           timestamp: Date.now(),
         });
+        ttsStarted = true;
         for await (const chunk of this.ttsProvider.synthesizeStream(text)) {
           this.wsServer.sendBinary(ws, chunk);
         }
-        this.wsServer.sendToClient(ws, {
-          type: 'tts_end',
-          payload: { requestId },
-          id: requestId,
-          timestamp: Date.now(),
-        });
       } catch (err) {
         console.warn('[WSService] Interview TTS failed:', err);
+      } finally {
+        // Always close the TTS frame once it was opened — a synthesis
+        // failure mid-stream must not leave the UI waiting forever.
+        if (ttsStarted) {
+          this.wsServer.sendToClient(ws, {
+            type: 'tts_end',
+            payload: { requestId },
+            id: requestId,
+            timestamp: Date.now(),
+          });
+        }
       }
     }
 
@@ -1334,7 +1598,7 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
     const trimmed = text.trim();
     if (!trimmed) return false;
 
-    // Window-control fast path — same as voice. Catches "close",
+    // Window-control fast path — regex-only, ~zero latency. Catches "close",
     // "minimize tools", "reorder layout" etc. without an LLM call.
     const winCtrl = matchWindowControl(trimmed);
     if (winCtrl) {
@@ -1346,65 +1610,15 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       return true;
     }
 
-    // Classify. Failure is tolerable — fall through to the chat agent.
-    const llm = this.agentService.getLLMManager();
-    const recentTurns = this.recentTurns('websocket');
-    const userProfilePrompt = formatUserProfileForPrompt(getUserProfile());
-    const intent = await classifyVoiceIntent(trimmed, recentTurns, llm, currentRoom, userProfilePrompt);
-    const route = routeByConfidence(intent);
-
-    console.log(
-      `[WSService] Text intent: verb=${intent.verb} impact=${intent.impact} ` +
-      `confidence=${intent.confidence.toFixed(2)} → ${route}`,
-    );
-
-    // Only intercept when the classifier is confident enough to act
-    // AND the intent is a command. Anything else falls through to the
-    // chat agent — voice would prompt for confirmation here, but text
-    // users want an answer, not a clarifier.
-    if (route !== 'act') return false;
-
-    if (intentIsBackToThread(intent)) {
-      this.broadcastNavigateHome(requestId);
-      this.broadcastAssistantAck("Going back to the thread.", requestId);
-      return true;
-    }
-
-    // Workflow-creation requests are better handled by the chat agent
-    // through the `manage_workflow` tool: the LLM can iterate on the
-    // composer's validation errors, name the flow, follow up with
-    // publish, etc. The voice path keeps the room_action route because
-    // a voice user can't easily iterate on tool output. Text users get
-    // the full tool loop.
-    if (
-      intent.room_action?.action === 'create_from_nl' ||
-      (intent.verb === 'create' && intent.object?.type === 'workflow')
-    ) {
-      return false;
-    }
-
-    if (intent.room_action) {
-      const ra = intent.room_action;
-      // Auto-open the target room first so the body's `useRoomActions`
-      // handler is registered by the time the action dispatches. The
-      // UI bus also queues actions when no handler is mounted yet, so
-      // even without this navigation the action would fire on register
-      // — but firing nav explicitly gives the user immediate visual
-      // feedback that the room is opening.
-      const targetRoom = ra.room as RoomKey;
-      this.broadcastRoomNavigation(targetRoom, requestId);
-      this.broadcastRoomAction(ra, requestId);
-      this.broadcastAssistantAck(ackForRoomAction(ra), requestId);
-      return true;
-    }
-
-    const roomKey = intentToRoomKey(intent);
-    if (roomKey) {
-      this.broadcastRoomNavigation(roomKey, requestId);
-      this.broadcastAssistantAck(`Opening the ${roomKey} room.`, requestId);
-      return true;
-    }
-
+    // The LLM-based voice_intent classifier used to run here for typed text
+    // to catch "navigate to settings" / "open the goals room" before the
+    // chat agent saw the message. That added 5-10s of latency on a slow
+    // `low` tier (e.g. local ollama qwen3) - blocking ALL typed input on a
+    // classification step the user didn't ask for. In conv-tier mode the
+    // conv LLM owns this responsibility (it can navigate via its delegate
+    // tool). Voice still runs the full classifier in processVoiceTranscript
+    // because voice users can't easily click UI buttons. Regex window-control
+    // above still fires for typed text - that's the cheap fast-path.
     return false;
   }
 
@@ -1681,8 +1895,9 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
             executed: false,
             channel: 'voice',
           });
-          // Same skip-on-intent-only path as the REST endpoint.
-          if (this.deferredExecutor && approved.tool_name !== 'request_approval') {
+          // Same skip-on-intent-only and skip-on-inline path as the REST
+          // endpoint: inline requests are executed by the blocked gate.
+          if (this.deferredExecutor && approved.tool_name !== 'request_approval' && approved.execution_mode !== 'inline') {
             try {
               await this.deferredExecutor.executeApproved(latest.id);
             } catch (err) {

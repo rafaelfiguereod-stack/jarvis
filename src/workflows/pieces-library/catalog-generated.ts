@@ -33,7 +33,7 @@ export interface GeneratedCatalogEntry {
 }
 
 /** Timestamp of the last generation pass (ISO date). */
-export const GENERATED_AT = "2026-06-21";
+export const GENERATED_AT = "2026-06-28";
 
 /** Activepieces commit the script walked when generating this list. */
 export const GENERATED_FROM_SHA = "d04e6807c485ecd788a72af0d04abffba78563c7";
@@ -852,8 +852,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "cal-com",
     npmPackage: "@activepieces/piece-cal-com",
-    versionRange: "^0.4.4",
-    latestVersion: "0.4.4",
+    versionRange: "^0.4.5",
+    latestVersion: "0.4.5",
     displayName: "Cal Com",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/cal-com",
@@ -2372,8 +2372,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "gmail",
     npmPackage: "@activepieces/piece-gmail",
-    versionRange: "^0.12.5",
-    latestVersion: "0.12.5",
+    versionRange: "^0.12.6",
+    latestVersion: "0.12.6",
     displayName: "Gmail",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/gmail",
@@ -2772,8 +2772,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "hubspot",
     npmPackage: "@activepieces/piece-hubspot",
-    versionRange: "^0.8.5",
-    latestVersion: "0.8.5",
+    versionRange: "^0.8.6",
+    latestVersion: "0.8.6",
     displayName: "Hubspot",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/hubspot",
@@ -3012,8 +3012,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "json",
     npmPackage: "@activepieces/piece-json",
-    versionRange: "^0.1.7",
-    latestVersion: "0.1.7",
+    versionRange: "^0.1.8",
+    latestVersion: "0.1.8",
     displayName: "Json",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/json",
@@ -4082,8 +4082,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "notion",
     npmPackage: "@activepieces/piece-notion",
-    versionRange: "^0.6.2",
-    latestVersion: "0.6.2",
+    versionRange: "^0.6.4",
+    latestVersion: "0.6.4",
     displayName: "Notion",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/notion",
@@ -5742,8 +5742,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "telegram-bot",
     npmPackage: "@activepieces/piece-telegram-bot",
-    versionRange: "^0.6.2",
-    latestVersion: "0.6.2",
+    versionRange: "^0.6.3",
+    latestVersion: "0.6.3",
     displayName: "Telegram Bot",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/telegram-bot",
@@ -5892,8 +5892,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "trello",
     npmPackage: "@activepieces/piece-trello",
-    versionRange: "^0.4.7",
-    latestVersion: "0.4.7",
+    versionRange: "^0.4.9",
+    latestVersion: "0.4.9",
     displayName: "Trello",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/trello",
@@ -5982,8 +5982,8 @@ export const GENERATED: GeneratedCatalogEntry[] = [
   {
     id: "umami",
     npmPackage: "@activepieces/piece-umami",
-    versionRange: "^0.1.6",
-    latestVersion: "0.1.6",
+    versionRange: "^0.2.0",
+    latestVersion: "0.2.0",
     displayName: "Umami",
     description: "",
     sourceUrl: "https://github.com/activepieces/activepieces/tree/d04e6807c485ecd788a72af0d04abffba78563c7/packages/pieces/community/umami",

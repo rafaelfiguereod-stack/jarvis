@@ -5,13 +5,8 @@ import { isWithin } from '../util/path.ts';
 import type { SidecarManager } from '../sidecar/manager.ts';
 
 /** Constant-time string comparison to prevent timing attacks */
-function safeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
-
 export type WSMessage = {
-  type: 'chat' | 'command' | 'status' | 'stream' | 'error' | 'notification'
+  type: 'chat' | 'cancel' | 'command' | 'status' | 'stream' | 'error' | 'notification'
       | 'tts_start' | 'tts_text' | 'tts_end' | 'voice_start' | 'voice_end' | 'voice_text'
       | 'interview_start' | 'interview_user_message' | 'interview_assistant' | 'interview_done' | 'interview_error'
       | 'thinking_start' | 'thinking_end'
@@ -61,7 +56,12 @@ export type WSMessage = {
       // Emitted when a pending voice confirmation (clarifier / repeat-back)
       // expires from the server-side TTL sweep. Payload: { id: string }.
       // Clients should dismiss the corresponding card from their UI.
-      | 'voice_confirmation_expired';
+      | 'voice_confirmation_expired'
+      // Emitted after DB-backed settings are hot-applied to the running
+      // daemon (per-section apply or POST /api/config/reload / SIGHUP).
+      // Payload: { sections: string[], ok: boolean, errors?: { section, error }[] }
+      // — section names and error strings only, never setting values.
+      | 'settings_applied';
   payload: unknown;
   id?: string;
   priority?: 'urgent' | 'normal' | 'low';
@@ -129,22 +129,45 @@ export class WebSocketServer {
   private clients: Set<ServerWebSocket<unknown>> = new Set();
   private handler: WSClientHandler | null = null;
   private port: number;
+  /** When set, bind a unix-domain socket instead of the TCP port (hosted mode). */
+  private unixPath: string | null = null;
+  /**
+   * Synchronous `process.on('exit')` cleanup for the unix socket, registered
+   * at bind. Guarantees the socket file is removed on ANY graceful process
+   * exit regardless of shutdown-ordering (the daemon stops several slow
+   * services before it reaches this one, and `jarvis stop`'s grace window can
+   * SIGKILL mid-shutdown before an ordered stop() runs). Removed by stop() to
+   * avoid stale handlers across restart-in-place. (SIGKILL is uncatchable; the
+   * next start's pre-bind unlink covers that abnormal case.)
+   */
+  private exitCleanup: (() => void) | null = null;
   private startTime: number = 0;
   private apiRoutes: Map<string, MethodRoutes> = new Map();
   private staticDir: string | null = null;
   private publicDir: string | null = null;
   private sidecarManager: SidecarManager | null = null;
-  private authToken: string | null = null;
+  /**
+   * JWT-only by default: every non-public route requires a valid short-lived
+   * sidecar access token (minted from an enrollment JWT). The ONLY way to
+   * open the dashboard without one is the explicit config escape hatch
+   * `auth.insecure_open_access: true` (pre-enrollment setup; see docs).
+   */
+  private insecureOpenAccess = false;
   private corsOrigin: string | null = null;
   private proxyLimiter = new ProxyRateLimiter();
 
-  constructor(port: number = 3142) {
+  constructor(port: number = 3142, unixPath?: string) {
     this.port = port;
+    this.unixPath = unixPath ?? null;
     this.corsOrigin = `http://localhost:${port}`;
   }
 
-  setAuthToken(token: string): void {
-    this.authToken = token;
+  setInsecureOpenAccess(enabled: boolean): void {
+    this.insecureOpenAccess = enabled;
+  }
+
+  setCorsOrigin(origin: string): void {
+    this.corsOrigin = origin.replace(/\/+$/, '');
   }
 
   setHandler(handler: WSClientHandler): void {
@@ -195,8 +218,24 @@ export class WebSocketServer {
     this.startTime = Date.now();
     const self = this;
 
-    this.server = Bun.serve<{ sidecar_id?: string; proxy_target?: string; _proxyUpstream?: WebSocket }>({
-      port: this.port,
+    // Unix mode: remove a stale socket file from a previous run first, or
+    // bind fails with EADDRINUSE even though nothing is listening. The socket
+    // must also be BORN 0660 (umask), not chmod'd after the fact - between
+    // bind and a post-hoc chmod the file briefly carries the process umask,
+    // and on a shared host that window is the tenant boundary.
+    let restoreUmask: number | null = null;
+    if (this.unixPath) {
+      try { require('node:fs').unlinkSync(this.unixPath); } catch { /* absent */ }
+      restoreUmask = process.umask(0o117); // 0666 & ~0117 = 0660
+    }
+
+    // Bun accepts either { port } or { unix } (mutually exclusive variants of
+    // a discriminated union). TypeScript can't narrow a conditional spread to
+    // one variant, so the pair is cast to the port variant; at runtime Bun
+    // receives exactly one of the two keys.
+    const listenOpts = (this.unixPath ? { unix: this.unixPath } : { port: this.port }) as { port: number };
+    this.server = Bun.serve<{ sidecar_id?: string; channel?: string; proxy_target?: string; _proxyUpstream?: WebSocket }>({
+      ...listenOpts,
       idleTimeout: 30, // seconds — prevent timeout during heavy processing (OCR, PowerShell)
 
       async fetch(req, server) {
@@ -218,27 +257,71 @@ export class WebSocketServer {
             return new Response('Invalid or revoked token', { status: 403 });
           }
 
-          const success = server.upgrade(req, { data: { sidecar_id: claims.sid } });
+          // A `?channel=audio` connection is the pebble's dedicated realtime
+          // audio pipe — isolated from this sidecar's bulk RPC/screenshot
+          // connection so a 2.4 MB capture can't queue in front of audio frames.
+          // Same JWT, so it's attributable to the same sidecar (claims.sid).
+          const channel = url.searchParams.get('channel') === 'audio' ? 'audio' : undefined;
+          const success = server.upgrade(req, { data: { sidecar_id: claims.sid, channel } });
           if (success) return undefined;
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
 
-        // 1. Auth check (if configured)
-        if (self.authToken && !isPublicRoute(pathname, req.method)) {
+        // 0b. Sidecar access-token mint. Authenticated by the long-lived
+        //     enrollment JWT (Authorization: Bearer) — this and /sidecar/connect
+        //     are the ONLY places that credential is accepted. Returns a
+        //     short-lived access token the sidecar injects into its panel
+        //     webviews; everything on the data plane (/api, /ws) authenticates
+        //     with that access token, never the enrollment JWT.
+        if (pathname === '/sidecar/token' && req.method === 'POST' && self.sidecarManager) {
+          const authHeader = req.headers.get('Authorization');
+          const enrollTok = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+          const claims = enrollTok ? await self.sidecarManager.validateToken(enrollTok) : null;
+          if (!claims?.sid) {
+            return new Response('Invalid or revoked token', { status: 403 });
+          }
+          const minted = await self.sidecarManager.issueAccessToken(claims.sid);
+          if (!minted) {
+            return Response.json({ error: 'mint failed' }, { status: 500 });
+          }
+          return Response.json({ access_token: minted.token, expires_in: minted.expiresIn });
+        }
+
+        // 1. Auth check. JWT-only by default: a request is authorized by a
+        // valid short-lived sidecar ACCESS token (minted from the enrollment
+        // JWT via /sidecar/token) - the sidecar's panel webviews carry one.
+        // The long-lived enrollment JWT is deliberately NOT accepted here —
+        // only on /sidecar/connect and the mint endpoint — so a leaked panel
+        // credential is bounded to the access-token TTL instead of forever.
+        // There is NO shared dashboard token: enroll a device or (setup only)
+        // set auth.insecure_open_access.
+        if (!self.insecureOpenAccess && !isPublicRoute(pathname, req.method)) {
+          const accepts = async (tok: string | null): Promise<boolean> => {
+            if (!tok) return false;
+            if (self.sidecarManager && (await self.sidecarManager.verifyAccessToken(tok))) return true;
+            return false;
+          };
           const cookieToken = getCookie(req, 'token');
-          if (!cookieToken || !safeCompare(cookieToken, self.authToken)) {
+          if (!(await accepts(cookieToken))) {
             // Check ?token= query param — set cookie via Set-Cookie and redirect
             const queryToken = url.searchParams.get('token');
-            if (queryToken && safeCompare(queryToken, self.authToken)) {
+            if (await accepts(queryToken)) {
               const cleanParams = new URLSearchParams(url.searchParams);
               cleanParams.delete('token');
               const qs = cleanParams.toString();
               const redirectTo = pathname + (qs ? '?' + qs : '');
+              // Mark the cookie Secure whenever the connection is TLS (directly,
+              // or terminated upstream and forwarded) so the token can't leak
+              // over a downgraded http request to the same host.
+              const xfProto = (req.headers.get('x-forwarded-proto') ?? '').split(',')[0]?.trim();
+              const isHttps = url.protocol === 'https:' || xfProto === 'https';
+              const cookie = `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly` +
+                (isHttps ? '; Secure' : '');
               return new Response(null, {
                 status: 302,
                 headers: {
                   'Location': redirectTo || '/',
-                  'Set-Cookie': `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly`,
+                  'Set-Cookie': cookie,
                 },
               });
             }
@@ -278,10 +361,15 @@ export class WebSocketServer {
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
 
-        // 3. Health check (always public)
+        // 3. Health check (always public). `version` is the pinned release the
+        // process was launched from (systemd sets JARVIS_VERSION from the
+        // per-instance EnvironmentFile); the hosting control plane reads it to
+        // CONFIRM a rolling update actually landed on the target version rather
+        // than trusting the restart. `null` on self-host (no pin).
         if (pathname === '/health') {
           return Response.json({
             status: 'ok',
+            version: process.env.JARVIS_VERSION ?? null,
             uptime: Date.now() - self.startTime,
             clients: self.clients.size,
             timestamp: Date.now(),
@@ -362,7 +450,7 @@ export class WebSocketServer {
           const overlayPath = path.join(self.staticDir, '..', 'overlay.html');
           const overlayFile = Bun.file(overlayPath);
           if (await overlayFile.exists()) {
-            if (self.authToken) {
+            if (!self.insecureOpenAccess) {
               const html = await overlayFile.text();
               return new Response(injectTokenStrip(html), { headers: { 'Content-Type': 'text/html' } });
             }
@@ -388,9 +476,20 @@ export class WebSocketServer {
 
           const file = Bun.file(filePath);
           if (await file.exists()) {
-            if (self.authToken && filePath.endsWith('.html')) {
-              const html = await file.text();
-              return new Response(injectTokenStrip(html), { headers: { 'Content-Type': 'text/html' } });
+            if (filePath.endsWith('.html')) {
+              // The HTML points at content-hashed JS/CSS bundles. Never let a
+              // browser or reverse proxy retain an old shell after an update,
+              // otherwise newly deployed controls (such as Stop) remain
+              // invisible even though the new bundle exists on the server.
+              const headers = {
+                'Content-Type': 'text/html',
+                'Cache-Control': 'no-store',
+              };
+              if (!self.insecureOpenAccess) {
+                const html = await file.text();
+                return new Response(injectTokenStrip(html), { headers });
+              }
+              return new Response(file, { headers });
             }
             return new Response(file);
           }
@@ -456,6 +555,12 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
+            // Dedicated realtime audio channel — register it, don't treat it as
+            // a second control connection.
+            if ((ws.data as any)?.channel === 'audio') {
+              self.sidecarManager.registerAudioChannel(sidecarId, ws);
+              return;
+            }
             self.sidecarManager.handleSidecarConnect(ws, sidecarId);
             return;
           }
@@ -477,6 +582,12 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
+            // Audio channel: binary frames are mic PCM; route them to the
+            // realtime session (text frames, if any, are control — ignored here).
+            if ((ws.data as any)?.channel === 'audio') {
+              if (message instanceof Buffer) self.sidecarManager.handleAudioFrame(sidecarId, message);
+              return;
+            }
             self.sidecarManager.handleSidecarMessage(ws, message);
             return;
           }
@@ -534,6 +645,12 @@ export class WebSocketServer {
 
           const sidecarId = (ws.data as any)?.sidecar_id as string | undefined;
           if (sidecarId && self.sidecarManager) {
+            // Audio channel closing must NOT tear down the control connection —
+            // just deregister the pipe.
+            if ((ws.data as any)?.channel === 'audio') {
+              self.sidecarManager.unregisterAudioChannel(sidecarId, ws);
+              return;
+            }
             self.sidecarManager.handleSidecarDisconnect(sidecarId);
             return;
           }
@@ -545,8 +662,33 @@ export class WebSocketServer {
       },
     });
 
-    console.log(`[WebSocketServer] Started on ws://localhost:${this.port}/ws`);
-    console.log(`[WebSocketServer] Health endpoint: http://localhost:${this.port}/health`);
+    if (restoreUmask !== null) process.umask(restoreUmask);
+    if (this.unixPath) {
+      // Caddy (same group) must be able to connect; the socket dir itself is
+      // the per-tenant boundary. The umask above made the socket 0660 at
+      // birth; verify rather than trust, and fail CLOSED if it is wrong.
+      const fs = require('node:fs');
+      const mode = fs.statSync(this.unixPath).mode & 0o777;
+      if (mode !== 0o660) {
+        try { fs.chmodSync(this.unixPath, 0o660); } catch { /* verified below */ }
+        if ((fs.statSync(this.unixPath).mode & 0o777) !== 0o660) {
+          this.stop();
+          throw new Error(`[WebSocketServer] Socket ${this.unixPath} has mode ${mode.toString(8)}, expected 660 - refusing to serve`);
+        }
+      }
+      // Guarantee the socket is gone on any graceful process exit, whatever
+      // the shutdown ordering. Capture the path so the handler can't race a
+      // later reassignment of this.unixPath.
+      const socketPath = this.unixPath;
+      this.exitCleanup = () => {
+        try { require('node:fs').unlinkSync(socketPath); } catch { /* already gone */ }
+      };
+      process.once('exit', this.exitCleanup);
+      console.log(`[WebSocketServer] Started on unix:${this.unixPath} (no TCP port bound)`);
+    } else {
+      console.log(`[WebSocketServer] Started on ws://localhost:${this.port}/ws`);
+      console.log(`[WebSocketServer] Health endpoint: http://localhost:${this.port}/health`);
+    }
     if (this.staticDir) {
       console.log(`[WebSocketServer] Dashboard: http://localhost:${this.port}/`);
     }
@@ -557,6 +699,18 @@ export class WebSocketServer {
       this.server.stop();
       this.server = null;
       this.clients.clear();
+      // Remove the socket file so ops probes don't see a dead-but-present
+      // socket (the pre-bind unlink only covers the NEXT start).
+      if (this.unixPath) {
+        try { require('node:fs').unlinkSync(this.unixPath); } catch { /* absent */ }
+      }
+      // Drop the exit-time cleanup: an explicit stop already removed the
+      // socket, and leaving it registered would let a restart-in-place on a
+      // new path be unlinked by this old instance's handler at process exit.
+      if (this.exitCleanup) {
+        process.removeListener('exit', this.exitCleanup);
+        this.exitCleanup = null;
+      }
       console.log('[WebSocketServer] Stopped');
     }
   }

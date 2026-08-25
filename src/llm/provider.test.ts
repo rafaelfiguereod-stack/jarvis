@@ -1,13 +1,16 @@
 import { test, expect, describe, beforeEach, afterEach, mock } from 'bun:test';
 import { AnthropicProvider } from './anthropic.ts';
 import { OpenAIProvider, modelRejectsCustomTemperature } from './openai.ts';
-import { GroqProvider, relaxOptionalFieldsToNullable } from './groq.ts';
+import { OpenAICompatibleProvider } from './openai-compatible.ts';
+import { GroqProvider, isGroqJarvisModel, relaxOptionalFieldsToNullable } from './groq.ts';
 import { OllamaProvider } from './ollama.ts';
 import { OpenRouterProvider } from './openrouter.ts';
 import { NVIDIAProvider } from './nvidia.ts';
 import { LiteLLMProvider } from './litellm.ts';
 import { LLMManager } from './manager.ts';
-import { guardImageSize, classifyHttpStatus, classifyErrorString, type LLMMessage, type ContentBlock } from './provider.ts';
+import { guardImageSize, classifyHttpStatus, classifyErrorString, LLMProviderError, type LLMMessage, type ContentBlock } from './provider.ts';
+import { setUsageDatabase } from './usage.ts';
+import { initDatabase, closeDb } from '../vault/schema.ts';
 import { isToolResult, type ToolResult } from '../actions/tools/registry.ts';
 
 describe('LLM Provider Types', () => {
@@ -211,6 +214,476 @@ describe('LLMManager', () => {
     expect(events.some((event) => event.type === 'done')).toBe(true);
     expect(events.some((event) => event.type === 'error')).toBe(false);
   });
+
+  test('does not retry a permanent streamed 400 before falling back', async () => {
+    const manager = new LLMManager();
+    let badCalls = 0;
+    const bad = {
+      name: 'bad',
+      listModels: async () => [],
+      async chat() { throw new Error('unused'); },
+      async *stream() {
+        badCalls++;
+        yield { type: 'error' as const, error: 'Groq API error (400): model_decommissioned', code: 'bad_request' as const };
+      },
+    };
+    const good = {
+      name: 'good',
+      listModels: async () => ['current'],
+      async chat() { throw new Error('unused'); },
+      async *stream() {
+        yield { type: 'text' as const, text: 'recovered' };
+        yield { type: 'done' as const, response: {
+          content: 'recovered', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'current', finish_reason: 'stop' as const,
+        } };
+      },
+    };
+    manager.registerProvider(bad);
+    manager.registerProvider(good);
+    manager.setFallbackChain(['good']);
+
+    const events = [];
+    for await (const event of manager.stream(sampleMessages)) events.push(event);
+    expect(badCalls).toBe(1);
+    expect(events.some((event) => event.type === 'text' && event.text === 'recovered')).toBe(true);
+  });
+
+  test('tier routing recovers a decommissioned saved model with the provider default', async () => {
+    const manager = new LLMManager();
+    const seenModels: Array<string | undefined> = [];
+    const groq = {
+      name: 'groq',
+      listModels: async () => ['openai/gpt-oss-20b'],
+      async chat(_messages: LLMMessage[], options?: { model?: string }) {
+        seenModels.push(options?.model);
+        if (options?.model === 'deepseek-r1-distill-llama-70b') {
+          throw new LLMProviderError('Groq API error (400): model_decommissioned', 'bad_request');
+        }
+        return {
+          content: 'current model ok', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'openai/gpt-oss-20b', finish_reason: 'stop' as const,
+        };
+      },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(groq);
+    manager.setTierMap({ medium: { provider: 'groq', model: 'deepseek-r1-distill-llama-70b' } });
+
+    const response = await manager.chatTier('medium', 'test', sampleMessages);
+    expect(response.content).toBe('current model ok');
+    expect(seenModels).toEqual(['deepseek-r1-distill-llama-70b', undefined]);
+  });
+
+  test('tier routing skips a rate-limited provider and fails over immediately', async () => {
+    const manager = new LLMManager();
+    let groqCalls = 0;
+    const groq = {
+      name: 'groq', listModels: async () => ['openai/gpt-oss-20b'],
+      async chat() {
+        groqCalls++;
+        throw new LLMProviderError('Groq API error (429): rate limit', 'rate_limit', 120_000);
+      },
+      async *stream() { /* not used */ },
+    };
+    const fallback = {
+      name: 'openai', listModels: async () => ['gpt-5-mini'],
+      async chat() { return {
+        content: 'provider fallback', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+        model: 'gpt-5-mini', finish_reason: 'stop' as const,
+      }; },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(groq);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'groq', model: 'openai/gpt-oss-20b' },
+      high: { provider: 'openai', model: 'gpt-5-mini' },
+    });
+
+    const response = await manager.chatTier('medium', 'test', sampleMessages);
+    expect(response.content).toBe('provider fallback');
+    expect(groqCalls).toBe(1);
+  });
+
+  test('tier routing does not send content to providers that have no tier assignment', async () => {
+    const manager = new LLMManager();
+    let unmappedCalls = 0;
+    const mapped = {
+      name: 'mapped', listModels: async () => ['retired'],
+      async chat() { throw new LLMProviderError('model_not_found', 'not_found'); },
+      async *stream() { /* not used */ },
+    };
+    const unmapped = {
+      name: 'unmapped', listModels: async () => ['available'],
+      async chat() {
+        unmappedCalls++;
+        return {
+          content: 'must not run', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'available', finish_reason: 'stop' as const,
+        };
+      },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(mapped);
+    manager.registerProvider(unmapped);
+    manager.setTierMap({ medium: { provider: 'mapped', model: 'retired' } });
+
+    await expect(manager.chatTier('medium', 'test', sampleMessages)).rejects.toBeInstanceOf(LLMProviderError);
+    expect(unmappedCalls).toBe(0);
+  });
+
+  test('background tier failover never crosses into the conversation tier', async () => {
+    const manager = new LLMManager();
+    let conversationCalls = 0;
+    const background = {
+      name: 'background', listModels: async () => ['retired'],
+      async chat() { throw new LLMProviderError('model_not_found', 'not_found'); },
+      async *stream() { /* not used */ },
+    };
+    const conversation = {
+      name: 'conversation', listModels: async () => ['expensive'],
+      async chat() {
+        conversationCalls++;
+        return {
+          content: 'must not run', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'expensive', finish_reason: 'stop' as const,
+        };
+      },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(background);
+    manager.registerProvider(conversation);
+    manager.setTierMap({
+      low: { provider: 'background', model: 'retired' },
+      conversation: { provider: 'conversation', model: 'expensive' },
+    });
+
+    await expect(manager.chatTier('low', 'background-test', sampleMessages))
+      .rejects.toBeInstanceOf(LLMProviderError);
+    expect(conversationCalls).toBe(0);
+  });
+
+  test('tier routing does not fail over malformed requests', async () => {
+    const manager = new LLMManager();
+    let fallbackCalls = 0;
+    const malformed = {
+      name: 'malformed', listModels: async () => ['model-a'],
+      async chat() { throw new LLMProviderError('invalid tool schema', 'bad_request'); },
+      async *stream() { /* not used */ },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() {
+        fallbackCalls++;
+        return {
+          content: 'must not run', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'model-b', finish_reason: 'stop' as const,
+        };
+      },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(malformed);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'malformed', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    await expect(manager.chatTier('medium', 'test', sampleMessages)).rejects.toMatchObject({
+      code: 'bad_request',
+    });
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('tier routing does not treat an unrelated 404 as model failover', async () => {
+    const manager = new LLMManager();
+    let fallbackCalls = 0;
+    const missingEndpoint = {
+      name: 'missing-endpoint', listModels: async () => ['model-a'],
+      async chat() { throw new LLMProviderError('POST /chat route not found', 'not_found'); },
+      async *stream() { /* not used */ },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() {
+        fallbackCalls++;
+        return {
+          content: 'must not run', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'model-b', finish_reason: 'stop' as const,
+        };
+      },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(missingEndpoint);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'missing-endpoint', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    await expect(manager.chatTier('medium', 'test', sampleMessages)).rejects.toMatchObject({
+      code: 'not_found',
+    });
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('tier routing fails over before a short Retry-After sleep', async () => {
+    const manager = new LLMManager();
+    let limitedCalls = 0;
+    const limited = {
+      name: 'limited', listModels: async () => ['model-a'],
+      async chat() {
+        limitedCalls++;
+        throw new LLMProviderError('quota exhausted', 'rate_limit', 30_000);
+      },
+      async *stream() { /* not used */ },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() { return {
+        content: 'immediate fallback', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+        model: 'model-b', finish_reason: 'stop' as const,
+      }; },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(limited);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'limited', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    const started = Date.now();
+    const response = await manager.chatTier('medium', 'test', sampleMessages);
+    expect(response.content).toBe('immediate fallback');
+    expect(limitedCalls).toBe(1);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test('tier routing fails over immediately on quota errors without Retry-After', async () => {
+    const manager = new LLMManager();
+    let limitedCalls = 0;
+    const limited = {
+      name: 'limited', listModels: async () => ['model-a'],
+      async chat() {
+        limitedCalls++;
+        throw new LLMProviderError('quota exhausted', 'rate_limit');
+      },
+      async *stream() { /* not used */ },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() { return {
+        content: 'immediate fallback', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+        model: 'model-b', finish_reason: 'stop' as const,
+      }; },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(limited);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'limited', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    const response = await manager.chatTier('medium', 'test', sampleMessages);
+    expect(response.content).toBe('immediate fallback');
+    expect(limitedCalls).toBe(1);
+  });
+
+  test('tier chat preserves Retry-After when every candidate is exhausted', async () => {
+    const manager = new LLMManager();
+    const groq = {
+      name: 'groq', listModels: async () => ['openai/gpt-oss-20b'],
+      async chat() { throw new LLMProviderError('quota exhausted', 'rate_limit', 120_000); },
+      async *stream() { /* not used */ },
+    };
+    manager.registerProvider(groq);
+    manager.setTierMap({ medium: { provider: 'groq', model: 'openai/gpt-oss-20b' } });
+
+    await expect(manager.chatTier('medium', 'test', sampleMessages)).rejects.toMatchObject({
+      code: 'rate_limit',
+      retryAfterMs: 120_000,
+    });
+  });
+
+  test('tier streaming preserves typed codes from thrown provider errors', async () => {
+    const manager = new LLMManager();
+    let fallbackCalls = 0;
+    const primary = {
+      name: 'primary', listModels: async () => ['model-a'],
+      async chat() { throw new Error('not used'); },
+      async *stream() { throw new LLMProviderError('opaque failure', 'auth'); },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() { throw new Error('not used'); },
+      async *stream() { fallbackCalls++; },
+    };
+    manager.registerProvider(primary);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'primary', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    const events = [];
+    for await (const event of manager.streamTier('medium', 'test', sampleMessages)) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'error', code: 'auth' });
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('tier streaming fails over before a short Retry-After sleep', async () => {
+    const manager = new LLMManager();
+    let limitedCalls = 0;
+    const limited = {
+      name: 'limited', listModels: async () => ['model-a'],
+      async chat() { throw new Error('not used'); },
+      async *stream() {
+        limitedCalls++;
+        yield {
+          type: 'error' as const,
+          error: 'quota exhausted',
+          code: 'rate_limit' as const,
+          retry_after_ms: 30_000,
+        };
+      },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() { throw new Error('not used'); },
+      async *stream() {
+        yield { type: 'text' as const, text: 'immediate fallback' };
+        yield { type: 'done' as const, response: {
+          content: 'immediate fallback', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'model-b', finish_reason: 'stop' as const,
+        } };
+      },
+    };
+    manager.registerProvider(limited);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'limited', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    const started = Date.now();
+    const events = [];
+    for await (const event of manager.streamTier('medium', 'test', sampleMessages)) events.push(event);
+    expect(events.some((event) => event.type === 'text' && event.text === 'immediate fallback')).toBe(true);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(limitedCalls).toBe(1);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test('tier streaming fails over immediately on quota errors without Retry-After', async () => {
+    const manager = new LLMManager();
+    let limitedCalls = 0;
+    const limited = {
+      name: 'limited', listModels: async () => ['model-a'],
+      async chat() { throw new Error('not used'); },
+      async *stream() {
+        limitedCalls++;
+        yield { type: 'error' as const, error: 'quota exhausted', code: 'rate_limit' as const };
+      },
+    };
+    const fallback = {
+      name: 'fallback', listModels: async () => ['model-b'],
+      async chat() { throw new Error('not used'); },
+      async *stream() {
+        yield { type: 'text' as const, text: 'immediate fallback' };
+        yield { type: 'done' as const, response: {
+          content: 'immediate fallback', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 },
+          model: 'model-b', finish_reason: 'stop' as const,
+        } };
+      },
+    };
+    manager.registerProvider(limited);
+    manager.registerProvider(fallback);
+    manager.setTierMap({
+      medium: { provider: 'limited', model: 'model-a' },
+      high: { provider: 'fallback', model: 'model-b' },
+    });
+
+    const events = [];
+    for await (const event of manager.streamTier('medium', 'test', sampleMessages)) events.push(event);
+    expect(events.some((event) => event.type === 'text' && event.text === 'immediate fallback')).toBe(true);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(limitedCalls).toBe(1);
+  });
+
+  test('tier streaming preserves Retry-After when every candidate is exhausted', async () => {
+    const manager = new LLMManager();
+    const groq = {
+      name: 'groq', listModels: async () => ['openai/gpt-oss-20b'],
+      async chat() { throw new Error('not used'); },
+      async *stream() {
+        yield {
+          type: 'error' as const,
+          error: 'Groq API error (429): rate limit',
+          code: 'rate_limit' as const,
+          retry_after_ms: 120_000,
+        };
+      },
+    };
+    manager.registerProvider(groq);
+    manager.setTierMap({ medium: { provider: 'groq', model: 'openai/gpt-oss-20b' } });
+
+    const events = [];
+    for await (const event of manager.streamTier('medium', 'test', sampleMessages)) events.push(event);
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'error',
+      code: 'rate_limit',
+      retry_after_ms: 120_000,
+    });
+  });
+
+  test('Retry-After sleeps draw down a shared per-provider budget', async () => {
+    const manager = new LLMManager() as unknown as {
+      waitForRetry(retryAfterMs: number | undefined, budget: { remainingMs: number }): Promise<boolean>;
+    };
+    const budget = { remainingMs: 100 };
+    expect(await manager.waitForRetry(60, budget)).toBe(true);
+    expect(budget.remainingMs).toBe(40);
+    // A second wait that would overrun the remaining budget fails over
+    // instead of stacking sleeps past the cap.
+    expect(await manager.waitForRetry(60, budget)).toBe(false);
+    // No Retry-After: retry immediately without drawing down the budget.
+    expect(await manager.waitForRetry(undefined, budget)).toBe(true);
+    expect(budget.remainingMs).toBe(40);
+  });
+
+  test('tier streaming records usage when the consumer stops mid-stream', async () => {
+    closeDb();
+    const db = initDatabase(':memory:');
+    setUsageDatabase(() => db);
+    try {
+      const manager = new LLMManager();
+      const streamer = {
+        name: 'streamer', listModels: async () => ['model-a'],
+        async chat(): Promise<never> { throw new Error('not used'); },
+        async *stream() {
+          yield { type: 'text' as const, text: 'first chunk' };
+          yield { type: 'text' as const, text: 'never consumed' };
+        },
+      };
+      manager.registerProvider(streamer);
+      manager.setTierMap({ medium: { provider: 'streamer', model: 'model-a' } });
+
+      for await (const event of manager.streamTier('medium', 'abort-test', sampleMessages)) {
+        if (event.type === 'text') break; // consumer disconnects mid-stream
+      }
+
+      const rows = db.query('SELECT provider, subsystem FROM llm_usage').all() as
+        Array<{ provider: string; subsystem: string }>;
+      expect(rows).toEqual([{ provider: 'streamer', subsystem: 'abort-test' }]);
+    } finally {
+      setUsageDatabase(() => null);
+      closeDb();
+    }
+  });
 });
 
 describe('Message Types', () => {
@@ -247,6 +720,17 @@ describe('Provider URLs', () => {
   test('OpenAIProvider uses correct API URL', () => {
     const provider = new OpenAIProvider('test-key') as any;
     expect(provider.apiUrl).toBe('https://api.openai.com/v1/chat/completions');
+  });
+
+  test('OpenAICompatibleProvider adds a version root to gateway URLs', () => {
+    const provider = new OpenAICompatibleProvider('https://gateway.example/api', '', 'test-key') as any;
+    expect(provider.apiUrl).toBe('https://gateway.example/api/v1/chat/completions');
+    expect(provider.modelsUrl).toBe('https://gateway.example/api/v1/models');
+  });
+
+  test('OpenAICompatibleProvider preserves an explicit version root', () => {
+    const provider = new OpenAICompatibleProvider('https://gateway.example/api/v1/', '', 'test-key') as any;
+    expect(provider.apiUrl).toBe('https://gateway.example/api/v1/chat/completions');
   });
 
   test('OpenRouterProvider uses correct API URL', () => {
@@ -293,7 +777,7 @@ describe('Default Models', () => {
 
   test('GroqProvider has correct default model', () => {
     const provider = new GroqProvider('test-key') as any;
-    expect(provider.defaultModel).toBe('llama-3.3-70b-versatile');
+    expect(provider.defaultModel).toBe('openai/gpt-oss-20b');
   });
 
   test('OpenRouterProvider has correct default model', () => {
@@ -536,6 +1020,29 @@ describe('Groq request shaping', () => {
     expect(out.properties.nested.properties.optional_inner.type).toEqual(['number', 'null']);
   });
 
+  test('live catalog filtering excludes non-chat routes', () => {
+    expect(isGroqJarvisModel('openai/gpt-oss-20b')).toBe(true);
+    expect(isGroqJarvisModel('qwen/qwen3.6-27b')).toBe(true);
+    expect(isGroqJarvisModel('minimaxai/minimax-m2.7')).toBe(true);
+    expect(isGroqJarvisModel('whisper-large-v3')).toBe(false);
+    expect(isGroqJarvisModel('canopylabs/orpheus-v1-english')).toBe(false);
+    expect(isGroqJarvisModel('groq/compound')).toBe(false);
+    expect(isGroqJarvisModel('groq/compound-mini')).toBe(false);
+    expect(isGroqJarvisModel('meta-llama/llama-guard-4-12b')).toBe(false);
+    expect(isGroqJarvisModel('openai/gpt-oss-safeguard-20b')).toBe(false);
+    expect(isGroqJarvisModel('playai-tts')).toBe(false);
+  });
+
+  // Groq answers /models per account: a committed-spend contract keeps
+  // serving IDs that are retired on the free and developer tiers. Since boot
+  // migration has already rewritten the saved reference, filtering these out
+  // of the picker would leave no way back to a model the account still owns.
+  test('live catalog keeps deprecated models the account can still reach', () => {
+    expect(isGroqJarvisModel('llama-3.3-70b-versatile')).toBe(true);
+    expect(isGroqJarvisModel('llama-3.1-8b-instant')).toBe(true);
+    expect(isGroqJarvisModel('deepseek-r1-distill-llama-70b')).toBe(true);
+  });
+
   test('GroqProvider relaxes optional tool params to accept null before sending', async () => {
     const provider = new GroqProvider('test-key') as any;
     await provider.chat(
@@ -694,6 +1201,23 @@ describe('Groq request shaping', () => {
     expect(response.content).toContain('retry ok');
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(secondBody).length).toBeLessThan(JSON.stringify(firstBody).length);
+  });
+
+  test('GroqProvider preserves Retry-After on 429 errors', async () => {
+    globalThis.fetch = mock(async () => new Response(
+      JSON.stringify({ error: { message: 'rate limit exceeded' } }),
+      { status: 429, headers: { 'retry-after': '2.5' } },
+    )) as unknown as typeof fetch;
+
+    const provider = new GroqProvider('test-key');
+    try {
+      await provider.chat([{ role: 'user', content: 'hi' }]);
+      throw new Error('expected Groq to reject');
+    } catch (error) {
+      expect(error).toBeInstanceOf(LLMProviderError);
+      expect((error as LLMProviderError).code).toBe('rate_limit');
+      expect((error as LLMProviderError).retryAfterMs).toBe(2500);
+    }
   });
 
   test('GroqProvider compaction never orphans a tool message from its assistant tool_call', async () => {
@@ -881,9 +1405,12 @@ describe('modelRejectsCustomTemperature', () => {
 });
 
 describe('classifyHttpStatus', () => {
-  test('401/403 → auth', () => {
+  test('401 → auth', () => {
     expect(classifyHttpStatus(401)).toBe('auth');
-    expect(classifyHttpStatus(403)).toBe('auth');
+  });
+
+  test('403 → forbidden, not auth — a working key without model access', () => {
+    expect(classifyHttpStatus(403)).toBe('forbidden');
   });
 
   test('429 → rate_limit', () => {
@@ -905,6 +1432,10 @@ describe('classifyHttpStatus', () => {
     expect(classifyHttpStatus(504)).toBe('network');
   });
 
+  test('non-standard 498 (gateway upstream expiry) → network (transient)', () => {
+    expect(classifyHttpStatus(498)).toBe('network');
+  });
+
   test('other 5xx → server', () => {
     expect(classifyHttpStatus(500)).toBe('server');
     expect(classifyHttpStatus(501)).toBe('server');
@@ -921,6 +1452,34 @@ describe('classifyErrorString', () => {
     expect(classifyErrorString('HTTP 401 Unauthorized')).toBe('auth');
     expect(classifyErrorString('invalid x-api-key')).toBe('auth');
     expect(classifyErrorString('Incorrect API key provided')).toBe('auth');
+  });
+
+  test('forbidden via 403 / permission markers', () => {
+    expect(classifyErrorString('HTTP 403 Forbidden')).toBe('forbidden');
+    expect(classifyErrorString('permission_error: not allowed to use this model')).toBe('forbidden');
+    expect(classifyErrorString('You do not have access to model gpt-5')).toBe('forbidden');
+  });
+
+  test('403 wins over the auth keywords it ships with', () => {
+    // Providers word 403s with auth-adjacent language; the status decides.
+    expect(classifyErrorString('403: authentication succeeded but access is denied')).toBe('forbidden');
+  });
+
+  test('a stated 401 keeps permission wording in the auth bucket', () => {
+    expect(classifyErrorString('401 Unauthorized: you do not have access')).toBe('auth');
+  });
+
+  test('permission wording alone, with no status, is forbidden', () => {
+    expect(classifyErrorString('permission denied for this model')).toBe('forbidden');
+    // Both wordings providers use for a model the caller can't reach.
+    expect(classifyErrorString('You do not have access to model gpt-5')).toBe('forbidden');
+    expect(classifyErrorString('Project `proj_a` does not have access to model `o3`')).toBe('forbidden');
+    // Google's canonical status uses an underscore, not a space.
+    expect(classifyErrorString('PERMISSION_DENIED: the API is not enabled')).toBe('forbidden');
+  });
+
+  test('word-boundary: 4030 does not collide with 403', () => {
+    expect(classifyErrorString('prompt has 4030 tokens')).not.toBe('forbidden');
   });
 
   test('rate_limit via 429 / quota / rate limit', () => {

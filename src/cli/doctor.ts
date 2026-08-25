@@ -85,7 +85,7 @@ export async function runDoctor(): Promise<void> {
     const { mergeLLMSettingsIntoConfig } = await import('../daemon/llm-settings.ts');
     llmConfig = await loadConfig();
     initDatabase(llmConfig.daemon.db_path);
-    mergeLLMSettingsIntoConfig(llmConfig);
+    mergeLLMSettingsIntoConfig(llmConfig, { persistMigrations: false });
     llmProviderNames = Object.keys(llmConfig.llm.providers ?? {});
   } catch (err) {
     results.push({ name: 'LLM Provider', status: 'fail', message: `Could not load LLM settings: ${String(err).slice(0, 80)}` });
@@ -95,7 +95,13 @@ export async function runDoctor(): Promise<void> {
     if (llmProviderNames.length === 0) {
       results.push({ name: 'LLM Provider', status: 'fail', message: 'No providers configured. Add one in Settings > LLM (http://localhost:3142).' });
     } else {
-      const tiers = llmConfig.llm.tiers ?? {};
+      // The ROUTING view, not the persisted one: on a hosted install the
+      // uj-* tier defaults live only in the binding view (they are
+      // deliberately never written to config.llm, so silence stays silent).
+      // Reading config.llm.tiers directly would report "no model assigned"
+      // for an install that routes perfectly well.
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
+      const tiers = effectiveLlmForBinding(llmConfig).tiers ?? {};
       const tierSummary = Object.entries(tiers).map(([t, v]) => `${t}=${v}`).join(', ');
       const mode = tierSummary ? `tiers: ${tierSummary}` : (llmConfig.llm.default ? `default: ${llmConfig.llm.default}` : 'no model assigned');
       results.push({ name: 'LLM Provider', status: 'ok', message: `${llmProviderNames.length} provider(s): ${llmProviderNames.join(', ')} (${mode})` });
@@ -109,9 +115,11 @@ export async function runDoctor(): Promise<void> {
     try {
       const { LLMManager } = await import('../llm/index.ts');
       const { registerLLMProviders, configureLLMTiers } = await import('../llm/config-binding.ts');
+      const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
       const manager = new LLMManager();
       registerLLMProviders(manager, llmConfig.llm.providers ?? {});
-      configureLLMTiers(manager, llmConfig.llm);
+      // Same routing view the daemon binds — see Check 4.
+      configureLLMTiers(manager, effectiveLlmForBinding(llmConfig));
       // manager.chat() routes through the medium tier (with fall-up) when a
       // tier/default is configured, else the first registered provider.
       const resp = await manager.chat(
@@ -180,9 +188,15 @@ export async function runDoctor(): Promise<void> {
 
   if (config?.stt?.provider) {
     const sttProv = config.stt.provider;
+    const { hasUsejarvisAi } = await import('../daemon/usejarvis-ai.ts');
     const hasKey = sttProv === 'ollama' || sttProv === 'local'
       || (sttProv === 'openai' && config.stt.openai?.api_key)
-      || (sttProv === 'groq' && config.stt.groq?.api_key);
+      || (sttProv === 'groq' && config.stt.groq?.api_key)
+      || (sttProv === 'sarvam' && config.stt.sarvam?.api_key)
+      // Hosted STT rides the system-owned usejarvis_ai credentials, not a
+      // cfg.stt key — "API key missing" here was a false alarm on every
+      // working hosted install.
+      || (sttProv === 'usejarvis' && hasUsejarvisAi(config));
     results.push({
       name: 'STT',
       status: hasKey ? 'ok' : 'warn',

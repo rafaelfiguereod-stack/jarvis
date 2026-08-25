@@ -113,6 +113,123 @@ describe('resolveRealtimeVoice', () => {
     expect(r2.ok && r2.resolved.reasoningEffort).toBe('low');
   });
 
+  // The ws derivation is a prefix rewrite, so a case-SENSITIVE one turns
+  // HTTPS://… into HTTPS://…/realtime — never dialable, and the failure reads
+  // as "realtime is broken" rather than "the scheme is wrong".
+  test('an uppercase scheme in the provisioned block still yields a ws(s) URL', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'HTTPS://LLM.Usejarvis.Host', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true, model: 'gpt-realtime-2' };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.resolved.url.startsWith('wss://')).toBe(true);
+    expect(res.resolved.modelsUrl!.startsWith('https://')).toBe(true);
+  });
+
+  // Provisioner typo classes the URL-based normalization must absorb: a
+  // scheme-less host previously left `replace(/^http/,'ws')` a no-op (the
+  // "URL" wasn't dialable at all), and an uppercase /V1 failed the
+  // case-sensitive suffix test, doubling into /V1/v1/realtime.
+  test('a scheme-less base_url reads as https and derives wss://', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'llm.usejarvis.host', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.resolved.url).toBe('wss://llm.usejarvis.host/v1/realtime');
+      expect(res.resolved.modelsUrl).toBe('https://llm.usejarvis.host/v1/models');
+    }
+  });
+
+  test('an uppercase /V1 suffix is recognized, not doubled', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'https://llm.usejarvis.host/V1', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.resolved.url).toBe('wss://llm.usejarvis.host/V1/realtime');
+      expect(res.resolved.modelsUrl).toBe('https://llm.usejarvis.host/V1/models');
+    }
+  });
+
+  test('trailing slashes are stripped before the /v1 suffix check', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'https://llm.usejarvis.host/v1///', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.resolved.url).toBe('wss://llm.usejarvis.host/v1/realtime');
+  });
+
+  test('an unparseable or non-http base_url refuses instead of dialing garbage', () => {
+    const bad = makeConfig();
+    bad.usejarvis_ai = { base_url: 'ftp://llm.usejarvis.host', api_key: 'sk-uj-abc' };
+    bad.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(bad);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain('scheme');
+  });
+
+  test('hosted fallback: no BYO key + usejarvis_ai block resolves the proxy session', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'https://llm.usejarvis.host', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true, model: 'gpt-realtime-2', monthly_budget_usd: 25 };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.resolved.provider).toBe('usejarvis_ai');
+      expect(res.resolved.url).toBe('wss://llm.usejarvis.host/v1/realtime');
+      expect(res.resolved.modelsUrl).toBe('https://llm.usejarvis.host/v1/models');
+      // The alias is fixed regardless of the configured model — the proxy
+      // resolves the actual model per plan.
+      expect(res.resolved.model).toBe('uj-realtime');
+      // The LOCAL estimate guard must not double-block hosted sessions.
+      expect(res.resolved.monthlyBudgetUsd).toBeUndefined();
+    }
+  });
+
+  test('hosted block with realtime disabled stays off; partial block falls to no-key', () => {
+    const disabled = makeConfig();
+    disabled.usejarvis_ai = { base_url: 'https://llm.usejarvis.host', api_key: 'sk-uj-abc' };
+    disabled.voice!.realtime = { enabled: false };
+    expect(resolveRealtimeVoice(disabled).ok).toBe(false);
+
+    const partial = makeConfig();
+    partial.usejarvis_ai = { base_url: 'https://llm.usejarvis.host' }; // no key
+    partial.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(partial);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toContain('no OpenAI key');
+  });
+
+  test('http dev proxy derives ws:// (not wss://)', () => {
+    const config = makeConfig();
+    config.usejarvis_ai = { base_url: 'http://dev-llm.usejarvis.dev:4000', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.resolved.url).toBe('ws://dev-llm.usejarvis.dev:4000/v1/realtime');
+      expect(res.resolved.modelsUrl).toBe('http://dev-llm.usejarvis.dev:4000/v1/models');
+    }
+  });
+
+  test("a user's own OpenAI key still wins over the hosted path", () => {
+    const config = withOpenAIProvider(makeConfig(), 'sk-user-own');
+    config.usejarvis_ai = { base_url: 'https://llm.usejarvis.host', api_key: 'sk-uj-abc' };
+    config.voice!.realtime = { enabled: true };
+    const res = resolveRealtimeVoice(config);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.resolved.provider).toBe('openai');
+      expect(res.resolved.apiKey).toBe('sk-user-own');
+      expect(res.resolved.url).toBe('wss://api.openai.com/v1/realtime');
+    }
+  });
+
   test('passes through blocked_categories and budget', () => {
     const config = withOpenAIProvider(makeConfig(), 'k');
     config.voice!.realtime = {

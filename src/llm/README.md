@@ -19,6 +19,10 @@ A unified abstraction layer for multiple LLM providers with automatic fallback s
 - **Features**: Text generation, streaming, tool use
 - **API**: https://api.anthropic.com/v1/messages
 
+Anthropic providers can also use a Claude-compatible gateway. In onboarding or **Settings > LLM**, enable **Use a custom Anthropic endpoint**, enter the gateway origin, and put the value normally used for `ANTHROPIC_AUTH_TOKEN` in the credential field. Jarvis appends `/v1/messages`, sends the token as `Authorization: Bearer …`, and reads available models from `/v1/models` when the gateway supports it.
+
+Leaving the base URL blank keeps the standard Anthropic endpoint and `x-api-key` authentication.
+
 ### 2. OpenAI GPT
 - **Models**: GPT-4o, GPT-4 Turbo, GPT-3.5 Turbo
 - **Default**: `gpt-4o`
@@ -30,6 +34,14 @@ A unified abstraction layer for multiple LLM providers with automatic fallback s
 - **Default**: `llama3`
 - **Features**: Local inference, streaming, tool use
 - **API**: http://localhost:11434/api/chat
+
+### 4. OmniRoute
+- **Routes**: Every model, free route, automatic route, and combo returned by the configured gateway
+- **Default route**: `auto`
+- **Features**: Text and multimodal messages, streaming, function/tool calling, live route discovery
+- **Default API**: http://localhost:20128/v1
+
+Jarvis also includes first-class adapters for Groq, Gemini, OpenRouter, NVIDIA NIM, LiteLLM, and generic OpenAI-compatible endpoints.
 
 ## Usage
 

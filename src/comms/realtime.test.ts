@@ -11,6 +11,9 @@ import type { LLMTool } from '../llm/provider.ts';
 import { BrowserAudioTransport } from './audio-transport.ts';
 
 const RESOLVED: ResolvedRealtimeVoice = {
+  provider: 'openai',
+  // Distinct from the OpenAI constant so a re-hardcoded connect() FAILS.
+  url: 'wss://proxy.test/v1/realtime',
   apiKey: 'sk-test',
   model: 'gpt-realtime-2',
   voice: 'marin',
@@ -72,7 +75,11 @@ class FakeSocket implements RealtimeSocket {
 
 function makeSession() {
   const socket = new FakeSocket();
-  const factory: RealtimeSocketFactory = () => socket;
+  const dialed: string[] = [];
+  const factory: RealtimeSocketFactory = (url) => {
+    dialed.push(String(url));
+    return socket;
+  };
   const sentAudio: Buffer[] = [];
   const transport = new BrowserAudioTransport({
     sendAudio: (c) => sentAudio.push(c),
@@ -85,10 +92,16 @@ function makeSession() {
     transport,
     socketFactory: factory,
   });
-  return { socket, session, transport, sentAudio };
+  return { socket, session, transport, sentAudio, dialed };
 }
 
 describe('RealtimeSession lifecycle', () => {
+  test('dials resolved.url, not a hardcoded endpoint', async () => {
+    const { session, dialed } = makeSession();
+    await session.connect();
+    expect(dialed[0]).toBe('wss://proxy.test/v1/realtime?model=gpt-realtime-2');
+  });
+
   test('sends session.update on open', async () => {
     const { socket, session } = makeSession();
     await session.connect();

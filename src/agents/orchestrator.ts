@@ -1,4 +1,5 @@
 import type { RoleDefinition } from '../roles/types.ts';
+import type { SystemPromptParts } from '../roles/prompt-builder.ts';
 import type { LLMMessage, LLMResponse, LLMStreamEvent, LLMToolCall, LLMTool, ContentBlock } from '../llm/provider.ts';
 import { guardImageSize } from '../llm/provider.ts';
 import { LLMManager } from '../llm/manager.ts';
@@ -14,6 +15,31 @@ import type { AuditTrail } from '../authority/audit.ts';
 import type { DeferredExecutor } from '../authority/deferred-executor.ts';
 import type { EmergencyController } from '../authority/emergency.ts';
 import { getActionForTool } from '../authority/tool-action-map.ts';
+import { progressAcknowledgement } from './progress.ts';
+
+/**
+ * Convert a system prompt (legacy string or static/dynamic parts) into the
+ * leading system messages of a conversation.
+ *
+ * Parts form: the static half is marked as a provider cache boundary
+ * (`cache: true`) - it is byte-stable turn-over-turn, so Anthropic can cache
+ * tools + static prompt across requests. The dynamic half follows unmarked.
+ *
+ * Legacy string form: a single unmarked system message. It may embed per-turn
+ * volatile content, so marking it would pay cache-write premiums with no
+ * reads; within-loop caching still applies via the provider's last-message
+ * breakpoint.
+ */
+function toSystemMessages(systemPrompt: string | SystemPromptParts): LLMMessage[] {
+  if (typeof systemPrompt === 'string') {
+    return [{ role: 'system', content: systemPrompt }];
+  }
+  const messages: LLMMessage[] = [{ role: 'system', content: systemPrompt.static, cache: true }];
+  if (systemPrompt.dynamic) {
+    messages.push({ role: 'system', content: systemPrompt.dynamic });
+  }
+  return messages;
+}
 
 const MAX_TOOL_ITERATIONS = 200;
 const MAX_TOOL_RESULT_CHARS = 6000; // Cap individual tool results to control context size
@@ -301,7 +327,7 @@ export class AgentOrchestrator {
    * @param subsystem Usage-tracking label for the tier call.
    */
   async processMessage(
-    systemPrompt: string,
+    systemPrompt: string | SystemPromptParts,
     message: string,
     tier: Tier = 'medium',
     subsystem: string = 'chat_orchestrator',
@@ -323,7 +349,7 @@ export class AgentOrchestrator {
 
     // Build local messages array for this turn (system + history)
     const messages: LLMMessage[] = [
-      { role: 'system', content: systemPrompt },
+      ...toSystemMessages(systemPrompt),
       ...primary.getMessages(),
     ];
 
@@ -398,7 +424,7 @@ export class AgentOrchestrator {
    * record so a subsequent `resume` can continue from the same buffer.
    */
   async processTaskCall(opts: {
-    systemPrompt: string;
+    systemPrompt: string | SystemPromptParts;
     userMessage: string;
     tier: Tier;
     subsystem: string;
@@ -416,7 +442,7 @@ export class AgentOrchestrator {
     const messages: LLMMessage[] = opts.history
       ? [...opts.history, { role: 'user', content: opts.userMessage }]
       : [
-          { role: 'system', content: opts.systemPrompt },
+          ...toSystemMessages(opts.systemPrompt),
           { role: 'user', content: opts.userMessage },
         ];
 
@@ -496,7 +522,7 @@ export class AgentOrchestrator {
    * Yields text/tool_call events through all iterations.
    * Only emits 'done' when the final response is complete.
    */
-  async *streamMessage(systemPrompt: string, message: string): AsyncIterable<LLMStreamEvent> {
+  async *streamMessage(systemPrompt: string | SystemPromptParts, message: string | import('../llm/provider.ts').ContentBlock[]): AsyncIterable<LLMStreamEvent> {
     const primary = this.getPrimary();
     if (!primary) {
       throw new Error('No primary agent exists. Create one first.');
@@ -507,7 +533,8 @@ export class AgentOrchestrator {
 
     // If no LLM manager, yield placeholder
     if (!this.llmManager) {
-      const response = `[No LLM configured] Received: ${message}`;
+      const stub = typeof message === 'string' ? message : '[image+text content]';
+      const response = `[No LLM configured] Received: ${stub}`;
       primary.addMessage('assistant', response);
       yield { type: 'text', text: response };
       yield {
@@ -525,7 +552,7 @@ export class AgentOrchestrator {
 
     // Build local messages array for this turn
     const messages: LLMMessage[] = [
-      { role: 'system', content: systemPrompt },
+      ...toSystemMessages(systemPrompt),
       ...primary.getMessages(),
     ];
 
@@ -533,6 +560,7 @@ export class AgentOrchestrator {
     const totalUsage = { input_tokens: 0, output_tokens: 0 };
     let finalText = '';
     let responseModel = 'unknown';
+    let acknowledgedWork = false;
 
     // Tool execution loop
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
@@ -599,6 +627,18 @@ export class AgentOrchestrator {
       }
 
       // Tool calls present — execute them
+      if (!accumulatedText.trim() && !acknowledgedWork) {
+        // Display-only activity narration for a model that called tools
+        // silently. It trails a blank line so the answer that follows doesn't
+        // run into it, and it stays out of `messages` — the model never said
+        // this, and attributing it back to the model would make the next turn
+        // reason from words it didn't write.
+        const narration = progressAcknowledgement(toolCalls) + '\n\n';
+        acknowledgedWork = true;
+        yield { type: 'text', text: narration, segmentEnd: true };
+        finalText += narration;
+      }
+      if (accumulatedText.trim()) acknowledgedWork = true;
       finalText += accumulatedText;
 
       // Add assistant message with tool calls to local messages

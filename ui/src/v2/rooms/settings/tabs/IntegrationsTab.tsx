@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { SettingsHook } from "../useSettingsData";
+import { confirmDialog } from "../../../ui/ConfirmDialog";
 
 export function IntegrationsTab({
   data,
@@ -13,17 +14,34 @@ export function IntegrationsTab({
   const [clientSecret, setClientSecret] = useState("");
   const [phase, setPhase] = useState<"idle" | "saving" | "authenticating">("idle");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [googleRedirectUri, setGoogleRedirectUri] = useState(
+    () => `${window.location.origin}/api/auth/google/callback`,
+  );
+  const [originWarnings, setOriginWarnings] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/system/external-origin")
+      .then((response) => response.json())
+      .then((result: { google_callback?: string; warnings?: string[] }) => {
+        if (cancelled) return;
+        if (result.google_callback) setGoogleRedirectUri(result.google_callback);
+        setOriginWarnings(result.warnings ?? []);
+      })
+      .catch(() => { /* keep the browser-origin guess; may differ from the daemon's resolved origin */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Listen for the OAuth popup completion event
   const handleMessage = useCallback(
     (event: MessageEvent) => {
-      if (event.data === "google-auth-complete") {
+      if (event.origin === window.location.origin && event.data === "google-auth-complete") {
         if (pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
         }
         setPhase("idle");
-        onToast("Connected. Restart Jarvis to activate Gmail and Calendar observers.", "ok");
+        onToast("Connected. Gmail and Calendar observers are starting.", "ok");
         data.refresh();
       }
     },
@@ -87,7 +105,7 @@ export function IntegrationsTab({
           pollRef.current = null;
           setPhase("idle");
           onToast(
-            "Connected. Restart Jarvis to activate Gmail and Calendar observers.",
+            "Connected. Gmail and Calendar observers are starting.",
             "ok",
           );
           data.refresh();
@@ -99,7 +117,7 @@ export function IntegrationsTab({
   };
 
   const handleDisconnect = async () => {
-    if (!confirm("Disconnect Google? You'll need to re-authorize to reconnect.")) return;
+    if (!await confirmDialog("Disconnect Google? You'll need to re-authorize to reconnect.")) return;
     const r = await data.disconnectGoogle();
     onToast(r.message, r.ok ? "ok" : "warn");
   };
@@ -111,7 +129,9 @@ export function IntegrationsTab({
           <div>
             <h3 className="v2-set__section-title">Google</h3>
             <div className="v2-set__section-sub">
-              Connect Gmail and Google Calendar (read-only). Restart-required after connect/disconnect.
+              {g?.managed
+                ? "Connect Gmail and Google Calendar (read-only), managed by usejarvis."
+                : "Connect Gmail and Google Calendar (read-only). Restart-required after connect/disconnect."}
             </div>
           </div>
           {g && (
@@ -120,7 +140,7 @@ export function IntegrationsTab({
                 "v2-set__chip " +
                 (g.status === "connected"
                   ? "v2-set__chip--ok"
-                  : g.status === "credentials_saved"
+                  : g.status === "credentials_saved" || g.status === "reconnect_required"
                     ? "v2-set__chip--warn"
                     : "")
               }
@@ -132,6 +152,53 @@ export function IntegrationsTab({
 
         {!g ? (
           <div className="v2-set__empty">Loading Google status…</div>
+        ) : g.managed ? (
+          /* HOSTED. The credentials form and this daemon's own OAuth flow do not
+             belong here: the account is connected through the control plane,
+             which owns the one redirect URI Google knows about. Connecting needs
+             a signed-in session this UI does not have (it authenticates to the
+             daemon with a device token, not the account), so the button hands
+             off to the account page — which then opens the system browser,
+             because Google refuses OAuth inside an embedded webview. */
+          <>
+            {g.is_authenticated ? (
+              <>
+                <p className="v2-set__hint">
+                  Gmail and Google Calendar are connected, read-only. Jarvis never sends mail or
+                  edits events.
+                </p>
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <a
+                    className="v2-set__btn"
+                    href={g.connect_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Manage in your account
+                  </a>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="v2-set__hint">
+                  {g.status === "reconnect_required"
+                    ? (g.reconnect_reason ??
+                      "Google access is no longer valid — connect your account again.")
+                    : "Connect your Google account to let Jarvis read your Gmail and Calendar. Nothing is sent or changed — access is read-only, and you can disconnect at any time."}
+                </p>
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <a
+                    className="v2-set__btn v2-set__btn--primary"
+                    href={g.connect_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Connect Google account
+                  </a>
+                </div>
+              </>
+            )}
+          </>
         ) : g.status === "not_configured" && phase !== "saving" ? (
           <>
             <p className="v2-set__hint">
@@ -149,12 +216,15 @@ export function IntegrationsTab({
                 <li>
                   Add this Authorized redirect URI:
                   <code className="v2-set__code v2-set__code--block">
-                    http://localhost:3142/api/auth/google/callback
+                    {googleRedirectUri}
                   </code>
                 </li>
                 <li>Paste the Client ID and Client Secret below</li>
               </ol>
             </div>
+            {originWarnings.map((warning) => (
+              <p className="v2-set__hint v2-set__hint--warn" key={warning}>{warning}</p>
+            ))}
             <div className="v2-set__field">
               <label className="v2-set__field-label">Client ID</label>
               <input
@@ -187,6 +257,13 @@ export function IntegrationsTab({
         ) : g.status === "credentials_saved" && phase === "idle" ? (
           <>
             <p className="v2-set__hint">Credentials saved. Connect a Google account to authorize.</p>
+            <div className="v2-set__field">
+              <div className="v2-set__field-label">Authorized redirect URI</div>
+              <code className="v2-set__code v2-set__code--block">{googleRedirectUri}</code>
+            </div>
+            {originWarnings.map((warning) => (
+              <p className="v2-set__hint v2-set__hint--warn" key={warning}>{warning}</p>
+            ))}
             <div style={{ display: "flex", gap: "var(--s-2)", flexWrap: "wrap" }}>
               <button
                 type="button"

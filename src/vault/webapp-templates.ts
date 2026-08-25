@@ -1,8 +1,10 @@
 /**
  * Webapp Templates — Pre-built browser navigation instructions
  *
- * Stores per-app instructions that get injected into the system prompt
- * when Jarvis detects a relevant webapp in the user's message or URL.
+ * Stores per-app instructions that get delivered to the model when the
+ * browser actually lands on a known webapp (browser_navigate/browser_snapshot
+ * resolve the page URL through getWebappTemplateByDomain). Mentioning an app
+ * in conversation does NOT load its template — only browsing it does.
  */
 
 import { getDb, generateId } from './schema.ts';
@@ -122,6 +124,10 @@ export function getWebappTemplateByName(appName: string): WebappTemplate | null 
 
 /**
  * Find templates matching a domain (e.g. "web.whatsapp.com").
+ *
+ * Domain entries may include a path prefix (e.g. "docs.google.com/spreadsheets")
+ * to disambiguate apps that share a hostname. When several templates match,
+ * the most specific (longest) domain entry wins.
  */
 export function getWebappTemplateByDomain(url: string): WebappTemplate | null {
   const db = getDb();
@@ -129,24 +135,33 @@ export function getWebappTemplateByDomain(url: string): WebappTemplate | null {
     'SELECT * FROM webapp_templates WHERE enabled = 1'
   ).all() as WebappRow[];
 
-  // Extract hostname from URL
+  // Extract hostname + path from URL
   let hostname: string;
+  let path = '';
   try {
-    hostname = new URL(url.startsWith('http') ? url : `https://${url}`).hostname;
+    const parsed = new URL(url.startsWith('http') ? url : `https://${url}`);
+    hostname = parsed.hostname;
+    path = parsed.pathname;
   } catch {
     hostname = url.toLowerCase();
   }
 
+  let best: { template: WebappTemplate; specificity: number } | null = null;
+
   for (const row of rows) {
     const domains: string[] = JSON.parse(row.domains);
     for (const domain of domains) {
-      if (hostname === domain || hostname.endsWith(`.${domain}`)) {
-        return rowToTemplate(row);
+      const [domainHost = '', ...pathParts] = domain.split('/');
+      const domainPath = pathParts.length > 0 ? `/${pathParts.join('/')}` : '';
+      const hostMatches = hostname === domainHost || hostname.endsWith(`.${domainHost}`);
+      const pathMatches = domainPath === '' || path.startsWith(domainPath);
+      if (hostMatches && pathMatches && (!best || domain.length > best.specificity)) {
+        best = { template: rowToTemplate(row), specificity: domain.length };
       }
     }
   }
 
-  return null;
+  return best?.template ?? null;
 }
 
 /**
@@ -162,83 +177,36 @@ export function listWebappTemplates(enabledOnly = true): WebappTemplate[] {
 }
 
 /**
- * Match webapp templates against a user message.
- * Checks for app name mentions, URL patterns, and keyword triggers.
- * Returns all matching templates (usually 0-1).
+ * Format a template into prompt-ready text. URL-driven delivery resolves at
+ * most one template per page, so this formats exactly one.
  */
-export function matchWebappTemplates(message: string): WebappTemplate[] {
-  const db = getDb();
-  const rows = db.prepare(
-    'SELECT * FROM webapp_templates WHERE enabled = 1'
-  ).all() as WebappRow[];
-
-  if (rows.length === 0) return [];
-
-  const msgLower = message.toLowerCase();
-  const matched: WebappTemplate[] = [];
-
-  for (const row of rows) {
-    const appNameLower = row.app_name.toLowerCase();
-
-    // Check if app name appears in message
-    if (msgLower.includes(appNameLower)) {
-      matched.push(rowToTemplate(row));
-      continue;
-    }
-
-    // Check if any domain appears in message
-    const domains: string[] = JSON.parse(row.domains);
-    let domainMatch = false;
-    for (const domain of domains) {
-      if (msgLower.includes(domain)) {
-        matched.push(rowToTemplate(row));
-        domainMatch = true;
-        break;
-      }
-    }
-    if (domainMatch) continue;
-
-    // Check if any keyword triggers match
-    const keywords: string[] = JSON.parse(row.keywords);
-    for (const keyword of keywords) {
-      if (msgLower.includes(keyword.toLowerCase())) {
-        matched.push(rowToTemplate(row));
-        break;
-      }
-    }
-  }
-
-  return matched;
+export function formatWebappInstructions(template: WebappTemplate): string {
+  return [
+    `## ${template.app_name} — Browser Instructions`,
+    `Domains: ${template.domains.join(', ')}`,
+    '',
+    template.instructions,
+  ].join('\n');
 }
 
 /**
- * Format matched templates into prompt-ready text.
+ * Main entry: resolve a page URL to its template's prompt-ready instructions.
+ * Used by the browser tools to deliver the playbook for the site the agent
+ * just landed on. Returns null when no template claims the URL.
  */
-export function formatWebappInstructions(templates: WebappTemplate[]): string {
-  if (templates.length === 0) return '';
-
-  const sections: string[] = [];
-
-  for (const t of templates) {
-    sections.push(`## ${t.app_name} — Browser Instructions`);
-    sections.push(`Domains: ${t.domains.join(', ')}`);
-    sections.push('');
-    sections.push(t.instructions);
-  }
-
-  return sections.join('\n');
-}
-
-/**
- * Main entry: get formatted webapp instructions for a user message.
- * Returns empty string if no matching templates found.
- */
-export function getWebappInstructionsForMessage(message: string): string {
+export function getWebappInstructionsForUrl(
+  url: string
+): { templateId: string; appName: string; instructions: string } | null {
   try {
-    const templates = matchWebappTemplates(message);
-    return formatWebappInstructions(templates);
+    const template = getWebappTemplateByDomain(url);
+    if (!template) return null;
+    return {
+      templateId: template.id,
+      appName: template.app_name,
+      instructions: formatWebappInstructions(template),
+    };
   } catch (err) {
-    console.error('[WebappTemplates] Error matching templates:', err);
-    return '';
+    console.error('[WebappTemplates] Error resolving template for URL:', err);
+    return null;
   }
 }

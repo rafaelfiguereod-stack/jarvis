@@ -27,6 +27,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
   - [Table of Contents](#table-of-contents)
   - [🔍 What Makes JARVIS Different](#-what-makes-jarvis-different)
   - [⚡ Quick Start](#-quick-start)
+  - [🪨 Ambient mode (recommended)](#-ambient-mode-recommended)
   - [☁️ Managed Hosting](#️-managed-hosting)
   - [💡 Use Cases](#-use-cases)
   - [📋 Requirements](#-requirements)
@@ -68,7 +69,7 @@ JARVIS is not a chatbot with tools. It is a persistent daemon that sees your scr
 | Voice with wake word | No | Yes — streaming TTS + openwakeword |
 | Goal pursuit (OKRs) | No | Yes — drill sergeant accountability |
 | Authority gating | No | Yes — runtime enforcement + audit trail |
-| LLM provider choice | Usually locked to one | 5 providers: Anthropic, OpenAI, Gemini, Ollama, Groq |
+| LLM provider choice | Usually locked to one | Anthropic, OpenAI, Gemini, Ollama, Groq, OpenRouter, OmniRoute, and more |
 
 ---
 
@@ -80,6 +81,27 @@ jarvis start -d                   # Start as background daemon
 ```
 
 Open `http://localhost:3142` — the dashboard walks you through LLM provider, voice, and a quick conversational profile interview the first time you visit.
+
+---
+
+## 🪨 Ambient mode
+
+JARVIS ships a "dashboard-less" experience built around a small cursor-following pebble — **on by default** after onboarding. Just run:
+
+```bash
+bun run start
+```
+
+What you get:
+
+- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey Jarvis"), `Ctrl+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when JARVIS is actively reading your screen.
+- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+K`. No browser tab.
+- **Sub-pebble rail** — say "in the background, research X" and a colored sub-pebble flies to the right edge of your screen. Click it to see what the agent is doing; "open full ↗" pops a dedicated result panel.
+- **Voice-first** — "what's on my screen?", "close all background agents", "open the workflows window", "in the background, summarize today's meeting notes" — all routed inline, no LLM round-trip for the common verbs.
+
+Currently **Windows-only** (cross-platform ports planned). The `localhost:3142` dashboard still works as a fallback / debug surface.
+
+> **Opt out:** set `JARVIS_AMBIENT_UI=0` to disable the pebble + sidecar voice loop (useful for headless servers, CI, or users who only want the web dashboard).
 
 ---
 
@@ -115,7 +137,7 @@ Visit [opencove.host](https://opencove.host) to get started.
 
 - **Bun** >= 1.0 (installed automatically if missing)
 - **OS (native daemon install)**: macOS, Linux, or WSL
-- **Windows**: use WSL2 for the Bun install, or Docker for the daemon
+- **Windows**: native Windows is not supported for the daemon - use WSL2 for the Bun install, or Docker for the daemon
 - **LLM API key** — at least one of: Anthropic, OpenAI, Google Gemini, or a local Ollama instance
 
 ---
@@ -133,7 +155,7 @@ The first time you run `jarvis start`, the daemon boots in setup mode and the da
 
 > **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `jarvis restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
 
-> **Note:** Native Windows installs are blocked for the JARVIS daemon. On Windows, use WSL2 for the Bun install above, or use the Docker install instead.
+> **Note:** Native Windows is not a supported platform for the JARVIS daemon. JARVIS is built for Unix-like systems (macOS, Linux, and WSL); supporting native Windows would mean porting to a fundamentally different OS, which is out of scope. On Windows, use WSL2 for the Bun install above, or use the Docker install instead.
 
 ### Docker
 
@@ -248,19 +270,38 @@ bun install -g @usejarvis/sidecar
 
 ### 3. Run the sidecar
 
-Paste and run the copied command on the machine where you installed the sidecar:
+Just start it:
 
 ```bash
-jarvis-sidecar --token <your-token>
+jarvis
 ```
 
-The sidecar saves the token locally, so on subsequent runs you just need:
+The first time it runs unconfigured, a small **setup window** pops up asking for
+the enrollment token — paste the token you copied and click **Connect**. The
+sidecar saves it locally (`~/.jarvis/sidecar.yaml`) and connects.
+
+Prefer the terminal / a headless box? Pass the token on the CLI instead (no
+window):
 
 ```bash
-jarvis-sidecar
+jarvis --token <your-token>
 ```
 
-Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness).
+Either way, subsequent runs are just `jarvis` (the saved token is reused).
+
+Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness, file watch, processes, notifications). The host-sensing observers (clipboard, file watch, process monitor, desktop notifications) run inside the sidecar on your machine and stream to the brain - the brain no longer observes its own host.
+
+### Versioning & updates
+
+The sidecar is versioned **independently of the brain** (`bun update -g @usejarvis/sidecar`, or grab a newer binary from [GitHub Releases](https://github.com/vierisid/jarvis/releases) -- the `sidecar-vX.Y.Z` releases). Run `jarvis --version` to see what you have.
+
+On connect, the brain checks the sidecar's version against its compatibility floors and surfaces the result in **Settings -> Sidecar**:
+
+- **OK** -- up to date enough; nothing to do.
+- **Update available** -- still compatible, but the brain recommends a newer sidecar; update when convenient.
+- **Update required** -- too old for this brain; the connection is refused and the sidecar logs an "update required" message. Update the sidecar and restart it.
+
+Local development builds report `dev` and are never blocked.
 
 ---
 
@@ -292,7 +333,9 @@ Once connected, the sidecar appears as online in the Settings page where you can
 
 ## ⚙️ Configuration
 
-JARVIS stores its configuration at `~/.jarvis/config.yaml`. Open the dashboard at `http://localhost:3142` after `jarvis start` for guided setup — it walks through LLM provider, voice, and a profile interview the first time. The Settings room lets you tweak channels, personality, and authority later.
+JARVIS stores its system configuration at `~/.jarvis/config.yaml`; user-level settings live in its database and are managed from the dashboard. Access is **JWT-only by default**: run `jarvis enroll "<device-name>"` and paste the printed token into the sidecar (desktop app), which connects and gives you the dashboard. Setting up without a sidecar? Temporarily add `auth:\n  insecure_open_access: true` to config.yaml, open `http://localhost:3142` after `jarvis start` for the guided setup, then **remove the flag** once your device is enrolled. The Settings room lets you tweak channels, personality, and authority later.
+
+Running the brain on another machine — a home server, a LAN box, or a VPS with a domain? Read [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for the reverse-proxy setup, `brain_domain`, device enrollment across machines, and what plain-HTTP access does and doesn't support.
 
 ```yaml
 daemon:
@@ -388,6 +431,7 @@ bun run db:init         # Initialize or reset the database
 General:
 
 - [config.example.yaml](config.example.yaml) — Full configuration reference
+- [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) — Deploying the brain: single machine, LAN, or VPS behind a reverse proxy
 - [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) — LLM provider configuration and routing
 - [docs/VAULT_EXTRACTOR.md](docs/VAULT_EXTRACTOR.md) — Memory and knowledge vault
 - [docs/PERSONALITY_ENGINE.md](docs/PERSONALITY_ENGINE.md) — Personality and role system

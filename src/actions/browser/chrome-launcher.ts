@@ -147,6 +147,15 @@ function findWindowsCandidates(): BrowserExecutable[] {
  * Returns when the CDP port is reachable.
  */
 export async function launchChrome(port: number = 9222, profileDir?: string): Promise<RunningBrowser> {
+  // Single choke point for browser.local: false (hosted instances). EVERY
+  // local-browser path funnels through here lazily (builtin browser tools,
+  // the background agent's bg browser), so no CDP port can ever open when
+  // the system config disables the local browser.
+  const { isLocalBrowserDisabled } = await import('../tools/local-tools-guard.ts');
+  if (isLocalBrowserDisabled()) {
+    throw new Error('The local browser is disabled on this machine (browser.local: false). Use a sidecar browser instead.');
+  }
+
   const exe = findBrowserExecutable();
   if (!exe) {
     throw new Error(
@@ -186,6 +195,14 @@ export async function launchChrome(port: number = 9222, profileDir?: string): Pr
       readFileSync('/proc/version', 'utf-8').toLowerCase().includes('microsoft');
     if (isWSL) {
       args.push('--ozone-platform=x11');
+    }
+
+    // Headless servers/containers have no X server. Without a display a
+    // windowed launch dies with "Missing X server or $DISPLAY", so fall back
+    // to headless when no DISPLAY is present (CDP works identically). Machines
+    // with a real display — desktops and WSLg — keep the visible window.
+    if (!isWSL && !process.env.DISPLAY) {
+      args.push('--headless=new');
     }
   }
 

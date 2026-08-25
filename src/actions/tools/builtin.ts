@@ -15,7 +15,8 @@ import { WSLBridge } from '../terminal/wsl-bridge.ts';
 import { BrowserController, type PageSnapshot } from '../browser/session.ts';
 import type { ToolDefinition, ToolResult } from './registry.ts';
 import type { LLMTool } from '../../llm/provider.ts';
-import { routeToSidecar } from './sidecar-route.ts';
+import { routeToSidecar, autoTargetForCapability } from './sidecar-route.ts';
+import { WebappTemplateDelivery, globalWebappTemplateDelivery } from './webapp-template-injection.ts';
 import { listSidecarsTool } from './sidecar-list.ts';
 import { DESKTOP_TOOLS } from './desktop.ts';
 
@@ -24,7 +25,7 @@ const terminal = new TerminalExecutor({ timeout: 30000 });
 // Shared browser controller (lazy-connected on first browser tool use)
 export const browser = new BrowserController();
 
-import { isNoLocalTools, LOCAL_DISABLED_MSG, getDefaultCwd } from './local-tools-guard.ts';
+import { isNoLocalTools, LOCAL_DISABLED_MSG, isLocalBrowserDisabled, LOCAL_BROWSER_DISABLED_MSG, getDefaultCwd } from './local-tools-guard.ts';
 // Re-export for convenience
 export { setNoLocalTools, isNoLocalTools, setDefaultCwd } from './local-tools-guard.ts';
 
@@ -86,7 +87,7 @@ export const runCommandTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('terminal');
     if (target) {
       return routeToSidecar(target, 'run_command', {
         command: params.command,
@@ -135,7 +136,7 @@ export const readFileTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'read_file', { path: params.path }, 'filesystem');
     }
@@ -187,7 +188,7 @@ export const writeFileTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'write_file', { path: params.path, content: params.content }, 'filesystem');
     }
@@ -221,7 +222,7 @@ export const listDirectoryTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'list_directory', { path: params.path }, 'filesystem');
     }
@@ -351,7 +352,8 @@ export const getClipboardTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'get_clipboard', {}, 'clipboard');
+    const auto = target || autoTargetForCapability('clipboard');
+    if (auto) return routeToSidecar(auto, 'get_clipboard', {}, 'clipboard');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const content = localClipboardRead();
@@ -380,7 +382,8 @@ export const setClipboardTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'set_clipboard', { content: params.content }, 'clipboard');
+    const auto = target || autoTargetForCapability('clipboard');
+    if (auto) return routeToSidecar(auto, 'set_clipboard', { content: params.content }, 'clipboard');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       localClipboardWrite(params.content as string);
@@ -404,7 +407,8 @@ export const captureScreenTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'capture_screen', {}, 'screenshot');
+    const auto = target || autoTargetForCapability('screenshot');
+    if (auto) return routeToSidecar(auto, 'capture_screen', {}, 'screenshot');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const base64 = localCaptureScreen();
@@ -428,7 +432,8 @@ export const getSystemInfoTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'get_system_info', {}, 'system_info');
+    const auto = target || autoTargetForCapability('system_info');
+    if (auto) return routeToSidecar(auto, 'get_system_info', {}, 'system_info');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     return JSON.stringify(localSystemInfo(), null, 2);
   },
@@ -528,6 +533,7 @@ function formatSnapshot(snap: PageSnapshot): string {
       if (el.attrs.role) attrParts.push(`role="${el.attrs.role}"`);
       if (el.attrs.contenteditable) attrParts.push(`contenteditable="${el.attrs.contenteditable}"`);
       if (el.attrs['data-testid']) attrParts.push(`data-testid="${el.attrs['data-testid']}"`);
+      if (el.attrs.iframe) attrParts.push(`iframe="${el.attrs.iframe}"`);
 
       const textStr = el.text ? ` "${el.text.slice(0, 50)}"` : '';
       const attrStr = attrParts.length > 0 ? ' ' + attrParts.join(' ') : '';
@@ -547,13 +553,18 @@ function formatSnapshot(snap: PageSnapshot): string {
 
 export const browserNavigateTool: ToolDefinition = {
   name: 'browser_navigate',
-  description: 'Navigate the browser to a URL. Returns page text content and a list of interactive elements with [id] numbers you can reference in browser_click and browser_type. Optionally specify a "target" sidecar to use a remote browser.',
+  description: 'Navigate the browser to a URL. Returns page text content and a list of interactive elements with [id] numbers you can reference in browser_click and browser_type. Optionally specify a "target" sidecar to use a remote browser. By default the browser opens visibly so the user can watch and interact; set "headless" to true to run it hidden in the background (useful for research, or when the user is focused on something else and a popping browser window would be intrusive).',
   category: 'browser',
   parameters: {
     url: {
       type: 'string',
       description: 'The URL to navigate to',
       required: true,
+    },
+    headless: {
+      type: 'boolean',
+      description: 'Run the browser hidden in the background instead of opening a visible window the user can see and interact with. Default false (visible). The mode is set when the browser launches; switching it while a browser is already open relaunches it.',
+      required: false,
     },
     target: {
       type: 'string',
@@ -562,14 +573,16 @@ export const browserNavigateTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
-      return routeToSidecar(target, 'browser_navigate', { url: params.url }, 'browser');
+      const result = await routeToSidecar(target, 'browser_navigate', { url: params.url, headless: params.headless }, 'browser');
+      return globalWebappTemplateDelivery.withInstructions(result, params.url as string);
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const snap = await browser.navigate(params.url as string);
-      return formatSnapshot(snap);
+      return globalWebappTemplateDelivery.withInstructions(formatSnapshot(snap), params.url as string);
     } catch (err) {
       return `Error: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -588,14 +601,16 @@ export const browserSnapshotTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
-      return routeToSidecar(target, 'browser_snapshot', {}, 'browser');
+      const result = await routeToSidecar(target, 'browser_snapshot', {}, 'browser');
+      return globalWebappTemplateDelivery.withInstructions(result);
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const snap = await browser.snapshot();
-      return formatSnapshot(snap);
+      return globalWebappTemplateDelivery.withInstructions(formatSnapshot(snap));
     } catch (err) {
       return `Error: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -604,12 +619,60 @@ export const browserSnapshotTool: ToolDefinition = {
 
 export const browserClickTool: ToolDefinition = {
   name: 'browser_click',
-  description: 'Click an interactive element on the page by its [id] from the last browser_navigate or browser_snapshot.',
+  description: 'Click an interactive element on the page by its [id] from the last browser_navigate or browser_snapshot. Supports right-click (button: "right", opens context menus) and double-click (double: true).',
   category: 'browser',
   parameters: {
     element_id: {
       type: 'number',
       description: 'The [id] of the element to click (from browser_snapshot)',
+      required: true,
+    },
+    button: {
+      type: 'string',
+      description: 'Mouse button: "left" (default) or "right" for a context-menu click',
+      required: false,
+    },
+    double: {
+      type: 'boolean',
+      description: 'Double-click instead of single click (default: false)',
+      required: false,
+    },
+    target: {
+      type: 'string',
+      description: 'Sidecar name or ID to use a remote browser (omit for local)',
+      required: false,
+    },
+  },
+  execute: async (params) => {
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
+    if (target) {
+      return routeToSidecar(target, 'browser_click', {
+        element_id: params.element_id,
+        button: params.button,
+        double: params.double,
+      }, 'browser');
+    }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
+    if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
+    try {
+      return await browser.click(params.element_id as number, {
+        button: params.button === 'right' ? 'right' : 'left',
+        double: (params.double as boolean) ?? false,
+      });
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  },
+};
+
+export const browserHoverTool: ToolDefinition = {
+  name: 'browser_hover',
+  description: 'Hover the mouse over an element by its [id]. Use this to reveal hover-only UI (message action toolbars, dropdown triggers, tooltips). After hovering, take a browser_snapshot to see the revealed elements, then click them without moving the mouse elsewhere first.',
+  category: 'browser',
+  parameters: {
+    element_id: {
+      type: 'number',
+      description: 'The [id] of the element to hover over (from browser_snapshot)',
       required: true,
     },
     target: {
@@ -619,13 +682,45 @@ export const browserClickTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
-      return routeToSidecar(target, 'browser_click', { element_id: params.element_id }, 'browser');
+      return routeToSidecar(target, 'browser_hover', { element_id: params.element_id }, 'browser');
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
-      return await browser.click(params.element_id as number);
+      return await browser.hover(params.element_id as number);
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  },
+};
+
+export const browserPressKeyTool: ToolDefinition = {
+  name: 'browser_press_key',
+  description: 'Press a key or key combination in the browser page (sent to the focused element). Examples: "Enter", "Escape", "Tab", "ArrowDown", "Ctrl+K", "Shift+Enter", "Ctrl+Shift+M". Use for in-app keyboard shortcuts, menu navigation, and committing edits. Note: browser-reserved shortcuts (Ctrl+N, Ctrl+T, Ctrl+1-9) are intercepted by Chrome and never reach the page — use in-page UI for those actions instead.',
+  category: 'browser',
+  parameters: {
+    key: {
+      type: 'string',
+      description: 'Key or combo to press, e.g. "Enter", "Escape", "Ctrl+K", "Shift+Enter"',
+      required: true,
+    },
+    target: {
+      type: 'string',
+      description: 'Sidecar name or ID to use a remote browser (omit for local)',
+      required: false,
+    },
+  },
+  execute: async (params) => {
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
+    if (target) {
+      return routeToSidecar(target, 'browser_press_key', { key: params.key }, 'browser');
+    }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
+    if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
+    try {
+      return await browser.pressKey(params.key as string);
     } catch (err) {
       return `Error: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -634,7 +729,7 @@ export const browserClickTool: ToolDefinition = {
 
 export const browserTypeTool: ToolDefinition = {
   name: 'browser_type',
-  description: 'Type text into an input element by its [id]. Set submit to true to press Enter after typing (useful for search forms).',
+  description: 'Type text into an input element by its [id]. IMPORTANT: by default this REPLACES the element\'s existing content (it is cleared first). Set append to true to keep existing content and add at the end. Set submit to true to press Enter after typing (useful for search forms).',
   category: 'browser',
   parameters: {
     element_id: {
@@ -652,6 +747,11 @@ export const browserTypeTool: ToolDefinition = {
       description: 'Press Enter after typing (default: false)',
       required: false,
     },
+    append: {
+      type: 'boolean',
+      description: 'Keep the element\'s existing content and insert at the end, instead of replacing it (default: false)',
+      required: false,
+    },
     target: {
       type: 'string',
       description: 'Sidecar name or ID to use a remote browser (omit for local)',
@@ -659,20 +759,23 @@ export const browserTypeTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_type', {
         element_id: params.element_id,
         text: params.text,
         submit: params.submit,
+        append: params.append,
       }, 'browser');
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       return await browser.type(
         params.element_id as number,
         params.text as string,
         (params.submit as boolean) ?? false,
+        (params.append as boolean) ?? false,
       );
     } catch (err) {
       return `Error: ${err instanceof Error ? err.message : String(err)}`;
@@ -692,10 +795,11 @@ export const browserScreenshotTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_screenshot', {}, 'browser');
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const { base64, mimeType } = await browser.screenshotBuffer();
@@ -728,6 +832,11 @@ export const browserUploadFileTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
+    // No sidecar route exists for uploads, so the generic "use a sidecar"
+    // guidance would send the agent in circles - say so explicitly.
+    if (isLocalBrowserDisabled()) {
+      return 'Error: browser_upload_file requires the LOCAL browser, which is disabled on this machine (browser.local: false), and file upload has no sidecar route yet. This action is unavailable - do NOT retry.';
+    }
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       return await browser.uploadFile(
@@ -762,13 +871,14 @@ export const browserScrollTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_scroll', {
         direction: params.direction,
         amount: params.amount,
       }, 'browser');
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const direction = (params.direction as string) === 'up' ? 'up' : 'down';
@@ -797,10 +907,11 @@ export const browserEvaluateTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_evaluate', { expression: params.expression }, 'browser');
     }
+    if (isLocalBrowserDisabled()) return LOCAL_BROWSER_DISABLED_MSG;
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const result = await browser.evaluate(params.expression as string);
@@ -837,6 +948,8 @@ export const BUILTIN_TOOLS: ToolDefinition[] = [
   browserSnapshotTool,
   browserClickTool,
   browserTypeTool,
+  browserHoverTool,
+  browserPressKeyTool,
   browserScrollTool,
   browserUploadFileTool,
   browserEvaluateTool,
@@ -850,6 +963,11 @@ export const BUILTIN_TOOLS: ToolDefinition[] = [
  * while keeping tool definitions identical to the main agent's.
  */
 export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
+  // Each bound tool set serves its own LLM conversation (e.g. a background
+  // agent), so it gets its own template-delivery state — sharing the global
+  // agent's would let one conversation's browsing suppress the playbook in
+  // the other's history.
+  const templateDelivery = new WebappTemplateDelivery();
   return [
     {
       name: 'browser_navigate',
@@ -859,7 +977,7 @@ export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
       execute: async (params) => {
         try {
           const snap = await ctrl.navigate(params.url as string);
-          return formatSnapshot(snap);
+          return templateDelivery.withInstructions(formatSnapshot(snap), params.url as string);
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -873,7 +991,7 @@ export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
       execute: async () => {
         try {
           const snap = await ctrl.snapshot();
-          return formatSnapshot(snap);
+          return templateDelivery.withInstructions(formatSnapshot(snap));
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -886,7 +1004,10 @@ export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
       parameters: browserClickTool.parameters,
       execute: async (params) => {
         try {
-          return await ctrl.click(params.element_id as number);
+          return await ctrl.click(params.element_id as number, {
+            button: params.button === 'right' ? 'right' : 'left',
+            double: (params.double as boolean) ?? false,
+          });
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -903,7 +1024,34 @@ export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
             params.element_id as number,
             params.text as string,
             (params.submit as boolean) ?? false,
+            (params.append as boolean) ?? false,
           );
+        } catch (err) {
+          return `Error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+    },
+    {
+      name: 'browser_hover',
+      description: browserHoverTool.description,
+      category: 'browser',
+      parameters: browserHoverTool.parameters,
+      execute: async (params) => {
+        try {
+          return await ctrl.hover(params.element_id as number);
+        } catch (err) {
+          return `Error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+    },
+    {
+      name: 'browser_press_key',
+      description: browserPressKeyTool.description,
+      category: 'browser',
+      parameters: browserPressKeyTool.parameters,
+      execute: async (params) => {
+        try {
+          return await ctrl.pressKey(params.key as string);
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }

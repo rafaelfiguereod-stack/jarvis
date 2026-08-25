@@ -9,12 +9,27 @@
 import { join } from 'node:path';
 import type { Service, ServiceStatus } from './services.ts';
 import type { JarvisConfig } from '../config/types.ts';
-import type { LLMStreamEvent, LLMMessage } from '../llm/provider.ts';
+import type { LLMStreamEvent, LLMMessage, LLMErrorCode } from '../llm/provider.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { PersonalityModel } from '../personality/model.ts';
 
 import { LLMManager } from '../llm/manager.ts';
+import { activeTurns, DrainingError } from './active-turns.ts';
 import { registerLLMProviders, configureLLMTiers } from '../llm/config-binding.ts';
+import { effectiveLlmForBinding } from './usejarvis-ai.ts';
+
+/** Wrap a turn's stream so the in-flight count is released when it settles
+ *  (exhausted, errored, or the consumer breaks). `endTurn` is idempotent. */
+async function* trackTurnStream(
+  inner: AsyncIterable<LLMStreamEvent>,
+  endTurn: () => void,
+): AsyncGenerator<LLMStreamEvent> {
+  try {
+    yield* inner;
+  } finally {
+    endTurn();
+  }
+}
 import { getDb } from '../vault/schema.ts';
 import { AgentOrchestrator } from '../agents/orchestrator.ts';
 import { loadRole } from '../roles/loader.ts';
@@ -28,7 +43,7 @@ import { researchQueueTool } from '../actions/tools/research.ts';
 import { documentTool } from '../actions/tools/documents.ts';
 import { AgentTaskManager } from '../agents/task-manager.ts';
 import { discoverSpecialists, formatSpecialistList } from '../agents/role-discovery.ts';
-import { buildSystemPrompt, type PromptContext } from '../roles/prompt-builder.ts';
+import { buildSystemPromptParts, type PromptContext, type SystemPromptParts } from '../roles/prompt-builder.ts';
 import type { ProgressCallback } from '../agents/sub-agent-runner.ts';
 import {
   getPersonality,
@@ -50,7 +65,6 @@ import { extractAndStore } from '../vault/extractor.ts';
 import { getKnowledgeForMessage } from '../vault/retrieval.ts';
 import { formatUserProfileForPrompt } from '../user/profile.ts';
 import { getUserProfile } from '../vault/user-profile.ts';
-import { getWebappInstructionsForMessage } from '../vault/webapp-templates.ts';
 import type { ResearchQueue } from './research-queue.ts';
 import type { IAgentService } from './agent-service-interface.ts';
 import type { AuthorityEngine } from '../authority/engine.ts';
@@ -271,13 +285,30 @@ export class AgentService implements Service, IAgentService {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
+    // Refuse new turns once draining; otherwise count this one in-flight so a
+    // graceful drain can await it (released when the tracked stream settles).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const inner = this.streamMessageInner(text, channel, siteContext);
+      return { stream: trackTurnStream(inner.stream, endTurn), onComplete: inner.onComplete };
+    } catch (err) {
+      endTurn();
+      throw err;
+    }
+  }
+
+  private streamMessageInner(text: string, channel: string = 'websocket', siteContext?: string): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
     if (this.convOrchestrator) {
       return this.streamMessageConv(text, channel);
     }
 
-    let systemPrompt = this.buildFullSystemPrompt(channel, text);
+    const systemPrompt = this.buildFullSystemPromptParts(channel, text);
     if (siteContext) {
-      systemPrompt += '\n\n' + siteContext;
+      systemPrompt.dynamic += '\n\n' + siteContext;
     }
 
     const stream = this.orchestrator.streamMessage(systemPrompt, text);
@@ -318,6 +349,7 @@ export class AgentService implements Service, IAgentService {
       let fullText = '';
       try {
         const identity = self.buildUserIdentityBlock();
+        const userProfile = self.buildUserProfileBlock();
         const recentDialogue = await self.loadRecentDialogue(channel);
         const ambient = self.buildAmbientFactsBlock(text);
 
@@ -328,15 +360,19 @@ export class AgentService implements Service, IAgentService {
 
         for await (const event of self.convOrchestrator.streamTurn(text, {
           userIdentity: identity,
+          userProfile,
           recentDialogue,
           ambientFacts: ambient,
         }, taskListener)) {
           if (event.type === 'text') {
             // Insert a separator so the acknowledgment text doesn't blur into
             // the later verbalization on the client side.
-            const chunk = (fullText && !fullText.endsWith('\n') ? '\n\n' : '') + event.text;
+            const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n\n' : '';
+            const chunk = separator + event.text;
             fullText += chunk;
-            yield { type: 'text', text: chunk };
+            // A segmentEnd-only event has no text; forward the signal so TTS
+            // can speak the finished acknowledgment without waiting.
+            yield { type: 'text', text: chunk, segmentEnd: event.segmentEnd };
           }
           // 'done' is implicit - the generator ends.
         }
@@ -353,8 +389,11 @@ export class AgentService implements Service, IAgentService {
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
+        const code = err && typeof err === 'object'
+          ? (err as { code?: LLMErrorCode }).code
+          : undefined;
         console.error('[AgentService] Conv stream error:', errorMsg);
-        yield { type: 'error', error: errorMsg };
+        yield { type: 'error', error: errorMsg, code };
       }
     })();
 
@@ -373,6 +412,62 @@ export class AgentService implements Service, IAgentService {
   }
 
   /**
+   * Multi-modal stream — same as streamMessage but the user message
+   * carries both an inline base64 image (e.g. a region screenshot
+   * captured by the pebble) and the user's text. Used by T19's
+   * "help with this" flow.
+   *
+   * NOTE: unlike streamMessage, this always uses the base primary agent and
+   * does NOT route through convOrchestrator when conv (router-first) mode is
+   * active — the conv path doesn't carry vision. Consequence: in conv mode,
+   * image turns run through a different agent than text turns, and the conv
+   * text stream's tool_call events (which drive the pebble's action narration)
+   * won't fire for image turns. Intentional for now; revisit if conv gains
+   * vision support.
+   */
+  streamMessageWithImage(
+    text: string,
+    imageBase64: string,
+    mediaType: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+  ): {
+    stream: AsyncIterable<LLMStreamEvent>;
+    onComplete: (fullText: string) => Promise<void>;
+  } {
+    // Same drain gate + in-flight tracking as streamMessage (the pebble image
+    // turn is a real turn — must not start mid-drain or run uncounted).
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+      if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+
+      const content: import('../llm/provider.ts').ContentBlock[] = [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+        { type: 'text', text },
+      ];
+      const stream = this.orchestrator.streamMessage(systemPrompt, content);
+
+      const onComplete = async (fullText: string): Promise<void> => {
+        await Promise.allSettled([
+          this.extractKnowledge(text, fullText).catch((err) =>
+            console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+          ),
+          this.learnFromInteraction(text, fullText, channel).catch((err) =>
+            console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+          ),
+        ]);
+      };
+
+      return { stream: trackTurnStream(stream, endTurn), onComplete };
+    } catch (err) {
+      endTurn();
+      throw err;
+    }
+  }
+
+  /**
    * Non-streaming message handler. Returns full response string.
    *
    * Routing:
@@ -383,26 +478,34 @@ export class AgentService implements Service, IAgentService {
    *     ReAct loop on the medium tier).
    */
   async handleMessage(text: string, channel: string = 'websocket'): Promise<string> {
-    let response: string;
+    // Non-streaming turn entry (external channels, etc). Background reactions go
+    // through BackgroundAgentService.handleMessage, which is gated separately.
+    if (activeTurns.isDraining) throw new DrainingError();
+    const endTurn = activeTurns.begin();
+    try {
+      let response: string;
 
-    if (this.convOrchestrator) {
-      response = await this.handleMessageConv(text, channel);
-    } else {
-      const systemPrompt = this.buildFullSystemPrompt(channel, text);
-      response = await this.orchestrator.processMessage(systemPrompt, text);
+      if (this.convOrchestrator) {
+        response = await this.handleMessageConv(text, channel);
+      } else {
+        const systemPrompt = this.buildFullSystemPromptParts(channel, text);
+        response = await this.orchestrator.processMessage(systemPrompt, text);
+      }
+
+      // Run extraction and learning in parallel (non-blocking but tracked)
+      Promise.allSettled([
+        this.extractKnowledge(text, response).catch((err) =>
+          console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
+        ),
+        this.learnFromInteraction(text, response, channel).catch((err) =>
+          console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
+        ),
+      ]);
+
+      return response;
+    } finally {
+      endTurn();
     }
-
-    // Run extraction and learning in parallel (non-blocking but tracked)
-    Promise.allSettled([
-      this.extractKnowledge(text, response).catch((err) =>
-        console.error('[AgentService] Extraction error:', err instanceof Error ? err.message : err)
-      ),
-      this.learnFromInteraction(text, response, channel).catch((err) =>
-        console.error('[AgentService] Learning error:', err instanceof Error ? err.message : err)
-      ),
-    ]);
-
-    return response;
   }
 
   /**
@@ -421,6 +524,7 @@ export class AgentService implements Service, IAgentService {
       text,
       {
         userIdentity: identity,
+        userProfile: this.buildUserProfileBlock(),
         recentDialogue,
         ambientFacts: this.buildAmbientFactsBlock(text),
       },
@@ -469,6 +573,25 @@ export class AgentService implements Service, IAgentService {
   }
 
   /**
+   * Full user profile (wizard answers + interview facts) for the conv LLM,
+   * giving it the same rich context about the user that the classic path
+   * injects via buildPromptContext -> formatUserProfileForPrompt. Rendered
+   * as its own cache-marked system block, so it stays out of the volatile
+   * identity line - keep anything that changes per turn out of here.
+   */
+  private buildUserProfileBlock(): string | undefined {
+    try {
+      const profile = getUserProfile();
+      const profileContext = formatUserProfileForPrompt(profile);
+      if (!profileContext) return undefined;
+      return `# User Profile\n${profileContext}`;
+    } catch (err) {
+      console.warn('[AgentService] Error loading user profile for conv prompt:', err);
+      return undefined;
+    }
+  }
+
+  /**
    * Compact ambient state for the conv LLM: knowledge graph facts relevant to
    * the current message + a tiny commitment summary. The vault retrieval is
    * already entity-match-driven so it stays empty when the message doesn't
@@ -507,8 +630,13 @@ export class AgentService implements Service, IAgentService {
   // --- Private methods ---
 
   private registerProviders(): void {
-    const { llm } = this.config;
-    const hasProvider = registerLLMProviders(this.llmManager, llm.providers ?? {});
+    // Bind through the effective view: hosted tier defaults live only in this
+    // per-bind copy (explicit ref → llm.default → plan alias), never in
+    // config.llm, so they can never leak into a persistence path.
+    const llm = effectiveLlmForBinding(this.config);
+    const hasProvider = registerLLMProviders(this.llmManager, llm.providers ?? {}, {
+      promptCache: llm.prompt_cache !== false,
+    });
 
     if (!hasProvider) {
       console.warn('[AgentService] No LLM providers configured. Responses will be placeholders.');
@@ -544,12 +672,16 @@ export class AgentService implements Service, IAgentService {
         signal,
         history,
       }) => {
-        const baseSystem = this.buildFullSystemPrompt('conv', originalMessage);
+        const baseSystem = this.buildFullSystemPromptParts('conv', originalMessage);
         const templateNote = TaskDispatcher.templatePromptFor(template);
         // Attach the conv LLM's routing intent as system context so the task
         // tier sees both the user's verbatim ask AND the conv's framing -
-        // but the user's words are the primary signal.
-        const systemPrompt = `${baseSystem}\n\n${templateNote}\n\nConversation routing note: ${intent}`;
+        // but the user's words are the primary signal. Both are per-task
+        // volatile, so they ride on the dynamic half of the prompt.
+        const systemPrompt: SystemPromptParts = {
+          static: baseSystem.static,
+          dynamic: `${baseSystem.dynamic}\n\n${templateNote}\n\nConversation routing note: ${intent}`,
+        };
         const result = await this.orchestrator.processTaskCall({
           systemPrompt,
           userMessage: originalMessage,
@@ -663,23 +795,50 @@ export class AgentService implements Service, IAgentService {
   }
 
   buildFullSystemPrompt(channel: string, userMessage?: string): string {
-    if (!this.role) return '';
+    const parts = this.buildFullSystemPromptParts(channel, userMessage);
+    if (!parts.static && !parts.dynamic) return '';
+    return parts.dynamic ? `${parts.static}\n\n${parts.dynamic}` : parts.static;
+  }
 
-    // Build prompt context with live data + vault knowledge
-    const context = this.buildPromptContext(userMessage);
+  /**
+   * System prompt split at the prompt-cache boundary: `static` is byte-stable
+   * turn-over-turn for a given channel (role prompt + channel personality),
+   * `dynamic` carries the per-turn context (time, observations, goals, ...).
+   * Callers hand the parts to the orchestrator, which marks the static half
+   * as a provider cache boundary.
+   */
+  buildFullSystemPromptParts(channel: string, userMessage?: string): SystemPromptParts {
+    if (!this.role) return { static: '', dynamic: '' };
 
-    // Build base system prompt from role + context
-    const rolePrompt = buildSystemPrompt(this.role, context);
+    // Build prompt context with live data + vault knowledge.
+    // For latency-sensitive voice channels (pebble), build a slimmer
+    // context: skip observations / content pipeline / commitments since
+    // conversational voice queries rarely benefit from them and the
+    // extra prompt tokens slow first-token-out by hundreds of ms.
+    const context = channel === 'pebble'
+      ? this.buildPromptContext(userMessage, { slim: true })
+      : this.buildPromptContext(userMessage);
 
-    // Build personality prompt for this channel
+    // Build base system prompt from role + context, split at the boundary
+    const roleParts = buildSystemPromptParts(this.role, context);
+
+    // Build personality prompt for this channel. Config-derived and
+    // time-invariant, so it belongs to the static (cacheable) half.
     const personality = this.personality ?? getPersonality();
     const channelPersonality = getChannelPersonality(personality, channel);
     const personalityPrompt = personalityToPrompt(channelPersonality);
 
-    return `${rolePrompt}\n\n${personalityPrompt}`;
+    return {
+      static: `${roleParts.static}\n\n${personalityPrompt}`,
+      dynamic: roleParts.dynamic,
+    };
   }
 
-  private buildPromptContext(userMessage?: string): PromptContext {
+  private buildPromptContext(userMessage?: string, opts?: { slim?: boolean }): PromptContext {
+    // Slim mode: voice channels skip the heavyweight context blocks
+    // (observations, content pipeline, commitments) so the LLM has
+    // hundreds fewer prompt tokens to chew through before first response.
+    const slim = opts?.slim === true;
     // Check if any sidecars are enrolled (cheap DB query, controls tool guide content)
     let hasSidecars = false;
     try {
@@ -719,38 +878,30 @@ export class AgentService implements Service, IAgentService {
       } catch (err) {
         console.error('[AgentService] Error retrieving knowledge:', err);
       }
+    }
 
-      // Retrieve webapp-specific browser instructions if message mentions a known app
+    // Get due commitments — skipped in slim/voice mode.
+    if (!slim) {
       try {
-        const webappInstructions = getWebappInstructionsForMessage(userMessage);
-        if (webappInstructions) {
-          context.webappInstructions = webappInstructions;
+        const due = getDueCommitments();
+        const upcoming = getUpcoming(5);
+        const allCommitments = [...due, ...upcoming];
+
+        if (allCommitments.length > 0) {
+          context.activeCommitments = allCommitments.map((c) => {
+            const dueStr = c.when_due
+              ? ` (due: ${new Date(c.when_due).toLocaleString()})`
+              : '';
+            return `[${c.priority}] ${c.what}${dueStr} — ${c.status}`;
+          });
         }
       } catch (err) {
-        console.error('[AgentService] Error retrieving webapp instructions:', err);
+        console.error('[AgentService] Error loading commitments:', err);
       }
     }
 
-    // Get due commitments
-    try {
-      const due = getDueCommitments();
-      const upcoming = getUpcoming(5);
-      const allCommitments = [...due, ...upcoming];
-
-      if (allCommitments.length > 0) {
-        context.activeCommitments = allCommitments.map((c) => {
-          const dueStr = c.when_due
-            ? ` (due: ${new Date(c.when_due).toLocaleString()})`
-            : '';
-          return `[${c.priority}] ${c.what}${dueStr} — ${c.status}`;
-        });
-      }
-    } catch (err) {
-      console.error('[AgentService] Error loading commitments:', err);
-    }
-
-    // Get active content pipeline items (not published)
-    try {
+    // Get active content pipeline items (not published) — skipped in slim/voice mode.
+    if (!slim) try {
       const activeContent = findContent({}).filter(
         (c) => c.stage !== 'published'
       ).slice(0, 10);
@@ -764,8 +915,8 @@ export class AgentService implements Service, IAgentService {
       console.error('[AgentService] Error loading content pipeline:', err);
     }
 
-    // Get recent observations
-    try {
+    // Get recent observations — skipped in slim/voice mode.
+    if (!slim) try {
       const observations = getRecentObservations(undefined, 10);
       if (observations.length > 0) {
         context.recentObservations = observations.map((o) => {

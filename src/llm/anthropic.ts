@@ -15,8 +15,9 @@ import { compactHistory, calculateHistoryBudget } from './history.ts';
 function classifyAnthropicErrorType(type: string): LLMErrorCode {
   switch (type) {
     case 'authentication_error':
-    case 'permission_error':
       return 'auth';
+    case 'permission_error':
+      return 'forbidden';
     case 'rate_limit_error':
       return 'rate_limit';
     case 'overloaded_error':
@@ -63,6 +64,8 @@ type AnthropicResponse = {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 };
 
@@ -71,7 +74,7 @@ type AnthropicStreamEvent =
   | { type: 'content_block_start'; index: number; content_block: AnthropicContentBlock }
   | { type: 'content_block_delta'; index: number; delta: { type: 'text_delta'; text: string } | { type: 'input_json_delta'; partial_json: string } }
   | { type: 'content_block_stop'; index: number }
-  | { type: 'message_delta'; delta: { stop_reason: string; usage?: { output_tokens: number } } }
+  | { type: 'message_delta'; delta: { stop_reason: string; usage?: { output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } } }
   | { type: 'message_stop' }
   | { type: 'error'; error: { type: string; message: string } };
 
@@ -87,20 +90,66 @@ const RETRY_BASE_DELAY_MS = 5000; // 5s, 10s, 20s
  * If you see that 400 again for a NEW model id, add its pattern to the regex
  * below. Do NOT try to pick a "safe" temperature value: the check is on
  * presence, not value. The only fix is to omit the field entirely.
+ *
+ * The adaptive-thinking family (Opus 4.7/4.8, Sonnet 5, Fable 5) all enforce
+ * this — omitting temperature is always safe (the model uses its default),
+ * so we match them pre-emptively rather than wait for a 400 in production.
  */
 function modelRejectsTemperature(model: string): boolean {
-  return /claude-opus-4-7/i.test(model);
+  return /claude-(opus-4-[78]|sonnet-5|fable-5)/i.test(model);
+}
+
+/**
+ * A system prompt block. Anthropic renders tools -> system -> messages, so a
+ * cache_control marker on a system block caches the tools and everything in
+ * the system prompt up to (and including) that block.
+ */
+type AnthropicSystemBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
+
+export function anthropicMessagesUrl(baseUrl?: string): string {
+  if (!baseUrl?.trim()) return 'https://api.anthropic.com/v1/messages';
+  const normalized = baseUrl.trim().replace(/\/+$/, '');
+  if (normalized.endsWith('/v1/messages')) return normalized;
+  if (normalized.endsWith('/v1')) return `${normalized}/messages`;
+  return `${normalized}/v1/messages`;
+}
+
+/** The public Anthropic origin still uses x-api-key even when typed explicitly. */
+export function isAnthropicCustomBaseUrl(baseUrl?: string): boolean {
+  if (!baseUrl?.trim()) return false;
+  try {
+    return new URL(baseUrl.trim()).origin !== 'https://api.anthropic.com';
+  } catch {
+    // Let fetch surface the malformed URL; never treat it as Anthropic's
+    // trusted origin for credential/header selection.
+    return true;
+  }
 }
 
 export class AnthropicProvider implements LLMProvider {
   name = 'anthropic';
   private apiKey: string;
   private defaultModel: string;
-  private apiUrl = 'https://api.anthropic.com/v1/messages';
+  private promptCache: boolean;
+  private apiUrl: string;
+  private bearerAuth: boolean;
+  private authHeader: string;
 
-  constructor(apiKey: string, defaultModel = 'claude-sonnet-4-5-20250929') {
+  constructor(
+    apiKey: string,
+    defaultModel = 'claude-sonnet-4-5-20250929',
+    opts?: { promptCache?: boolean; baseUrl?: string; authHeader?: string },
+  ) {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
+    this.promptCache = opts?.promptCache !== false;
+    this.apiUrl = anthropicMessagesUrl(opts?.baseUrl);
+    this.bearerAuth = isAnthropicCustomBaseUrl(opts?.baseUrl);
+    this.authHeader = opts?.authHeader || (this.bearerAuth ? 'Authorization' : 'x-api-key');
   }
 
   /**
@@ -108,10 +157,12 @@ export class AnthropicProvider implements LLMProvider {
    */
   private async fetchWithRetry(body: string, stream: boolean = false): Promise<Response> {
     const headers: Record<string, string> = {
-      'x-api-key': this.apiKey,
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
     };
+    headers[this.authHeader] = this.authHeader.toLowerCase() === 'authorization'
+      ? `Bearer ${this.apiKey}`
+      : this.apiKey;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       const response = await fetch(this.apiUrl, {
@@ -133,9 +184,11 @@ export class AnthropicProvider implements LLMProvider {
         continue;
       }
 
-      // Non-retryable error
+      // Non-retryable error. Cap the body: a misrouted request can return a
+      // whole HTML page, and this message is pattern-matched downstream.
       const errorText = await response.text();
-      throw new Error(`Anthropic API error (${response.status}): ${errorText}`);
+      const detail = errorText.length > 2000 ? `${errorText.slice(0, 2000)}…` : errorText;
+      throw new Error(`Anthropic API error (${response.status}): ${detail}`);
     }
 
     throw new Error('Anthropic API: max retries exceeded');
@@ -149,13 +202,14 @@ export class AnthropicProvider implements LLMProvider {
     const compactedMessages = compactHistory(messages, budget);
 
     const { system, messages: anthropicMessages } = this.convertMessages(compactedMessages);
+    this.applyLastMessageBreakpoint(anthropicMessages);
     const body: Record<string, unknown> = {
       model,
       messages: anthropicMessages,
       max_tokens,
     };
 
-    if (system) body.system = system;
+    if (system && system.length > 0) body.system = system;
     if (temperature !== undefined && !modelRejectsTemperature(model)) {
       body.temperature = temperature;
     }
@@ -165,8 +219,112 @@ export class AnthropicProvider implements LLMProvider {
     }
 
     const response = await this.fetchWithRetry(JSON.stringify(body));
+    if (response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
+      return this.parseSSEChatResponse(await response.text(), model);
+    }
     const data = await response.json() as AnthropicResponse;
     return this.convertResponse(data);
+  }
+
+  /**
+   * Some Anthropic-compatible gateways always answer with SSE, even when the
+   * request omits `stream`. Accept that wire format on the regular chat path
+   * instead of trying to parse the event stream as one JSON document.
+   */
+  private parseSSEChatResponse(raw: string, fallbackModel: string): LLMResponse {
+    let content = '';
+    let model = fallbackModel;
+    let stopReason: string | null = null;
+    const usage: LLMResponse['usage'] = { input_tokens: 0, output_tokens: 0 };
+    const toolCalls: LLMToolCall[] = [];
+    const pendingTools = new Map<number, { id: string; name: string; input: string }>();
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+
+      let event: AnthropicStreamEvent;
+      try {
+        event = JSON.parse(payload) as AnthropicStreamEvent;
+      } catch (err) {
+        throw new Error(`Anthropic gateway returned invalid SSE JSON: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      if (event.type === 'error') {
+        throw new Error(`${event.error.type}: ${event.error.message}`);
+      }
+      if (event.type === 'message_start') {
+        if (event.message.model) model = event.message.model;
+        if (event.message.usage) {
+          usage.input_tokens = event.message.usage.input_tokens ?? 0;
+          usage.output_tokens = event.message.usage.output_tokens ?? 0;
+          if (event.message.usage.cache_read_input_tokens !== undefined) {
+            usage.cache_read_input_tokens = event.message.usage.cache_read_input_tokens;
+          }
+          if (event.message.usage.cache_creation_input_tokens !== undefined) {
+            usage.cache_creation_input_tokens = event.message.usage.cache_creation_input_tokens;
+          }
+        }
+      } else if (event.type === 'content_block_start') {
+        if (event.content_block.type === 'text') {
+          content += event.content_block.text ?? '';
+        } else if (event.content_block.type === 'tool_use') {
+          pendingTools.set(event.index, {
+            id: event.content_block.id,
+            name: event.content_block.name,
+            input: Object.keys(event.content_block.input ?? {}).length > 0
+              ? JSON.stringify(event.content_block.input)
+              : '',
+          });
+        }
+      } else if (event.type === 'content_block_delta') {
+        if (event.delta.type === 'text_delta') {
+          content += event.delta.text;
+        } else if (event.delta.type === 'input_json_delta') {
+          const pending = pendingTools.get(event.index);
+          if (pending) pending.input += event.delta.partial_json;
+        }
+      } else if (event.type === 'content_block_stop') {
+        const pending = pendingTools.get(event.index);
+        if (pending) {
+          try {
+            toolCalls.push({
+              id: pending.id,
+              name: pending.name,
+              arguments: JSON.parse(pending.input || '{}') as Record<string, unknown>,
+            });
+          } catch {
+            // Truncated JSON (max_tokens hit mid-tool-call). Mirror the
+            // streaming path: drop the unusable call and tell the model why,
+            // rather than throwing away an otherwise complete response.
+            console.error(`[Anthropic] Tool call '${pending.name}' truncated (${pending.input.length} chars of JSON). max_tokens likely hit.`);
+            content += `\n\n[SYSTEM WARNING: Your tool call to "${pending.name}" was truncated due to output token limits. ` +
+              `The call was NOT executed. If you were writing long content, use append_body with shorter chunks (under 1000 words per call).]`;
+          }
+          pendingTools.delete(event.index);
+        }
+      } else if (event.type === 'message_delta') {
+        stopReason = event.delta.stop_reason;
+        if (event.delta.usage) {
+          usage.output_tokens = event.delta.usage.output_tokens;
+          if (event.delta.usage.cache_read_input_tokens !== undefined) {
+            usage.cache_read_input_tokens = event.delta.usage.cache_read_input_tokens;
+          }
+          if (event.delta.usage.cache_creation_input_tokens !== undefined) {
+            usage.cache_creation_input_tokens = event.delta.usage.cache_creation_input_tokens;
+          }
+        }
+      }
+    }
+
+    return {
+      content,
+      tool_calls: toolCalls,
+      usage,
+      model,
+      finish_reason: this.mapStopReason(stopReason),
+    };
   }
 
   async *stream(messages: LLMMessage[], options: LLMOptions = {}): AsyncIterable<LLMStreamEvent> {
@@ -177,6 +335,7 @@ export class AnthropicProvider implements LLMProvider {
     const compactedMessages = compactHistory(messages, budget);
 
     const { system, messages: anthropicMessages } = this.convertMessages(compactedMessages);
+    this.applyLastMessageBreakpoint(anthropicMessages);
     const body: Record<string, unknown> = {
       model,
       messages: anthropicMessages,
@@ -184,16 +343,13 @@ export class AnthropicProvider implements LLMProvider {
       stream: true,
     };
 
-    if (system) body.system = system;
+    if (system && system.length > 0) body.system = system;
     if (temperature !== undefined && !modelRejectsTemperature(model)) {
       body.temperature = temperature;
     }
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       // Anthropic automatically uses tools when provided (no explicit tool_choice needed)
-    }
-    if (tools && tools.length > 0) {
-      body.tools = this.convertTools(tools);
     }
 
     let response: Response;
@@ -214,7 +370,7 @@ export class AnthropicProvider implements LLMProvider {
     const toolCalls: LLMToolCall[] = [];
     let currentToolCall: { id: string; name: string; input_json: string } | null = null;
     let stopReason: string | null = null;
-    let usage = { input_tokens: 0, output_tokens: 0 };
+    const usage: LLMResponse['usage'] = { input_tokens: 0, output_tokens: 0 };
     let responseModel = model;
 
     try {
@@ -241,6 +397,12 @@ export class AnthropicProvider implements LLMProvider {
 
             if (event.type === 'message_start' && event.message.usage) {
               usage.input_tokens = event.message.usage.input_tokens;
+              if (event.message.usage.cache_read_input_tokens !== undefined) {
+                usage.cache_read_input_tokens = event.message.usage.cache_read_input_tokens;
+              }
+              if (event.message.usage.cache_creation_input_tokens !== undefined) {
+                usage.cache_creation_input_tokens = event.message.usage.cache_creation_input_tokens;
+              }
               if (event.message.model) responseModel = event.message.model;
             } else if (event.type === 'content_block_start') {
               if (event.content_block.type === 'tool_use') {
@@ -281,6 +443,12 @@ export class AnthropicProvider implements LLMProvider {
               stopReason = event.delta.stop_reason;
               if (event.delta.usage) {
                 usage.output_tokens = event.delta.usage.output_tokens;
+                if (event.delta.usage.cache_read_input_tokens !== undefined) {
+                  usage.cache_read_input_tokens = event.delta.usage.cache_read_input_tokens;
+                }
+                if (event.delta.usage.cache_creation_input_tokens !== undefined) {
+                  usage.cache_creation_input_tokens = event.delta.usage.cache_creation_input_tokens;
+                }
               }
             } else if (event.type === 'error') {
               yield {
@@ -314,23 +482,68 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async listModels(): Promise<string[]> {
-    // Anthropic doesn't have a models endpoint, so return known models
-    return [
-      'claude-opus-4-6',
-      'claude-sonnet-4-5-20250929',
-      'claude-3-5-sonnet-20241022',
-      'claude-3-opus-20240229',
-      'claude-3-sonnet-20240229',
-      'claude-3-haiku-20240307',
+    const knownModels = [
+      'claude-fable-5',
+      'claude-opus-4-8',
+      'claude-sonnet-5',
+      'claude-opus-4-7',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5-20251001',
     ];
+    if (!this.bearerAuth) return knownModels;
+
+    try {
+      const response = await fetch(this.apiUrl.replace(/\/messages$/, '/models'), {
+        headers: {
+          [this.authHeader]: this.authHeader.toLowerCase() === 'authorization'
+            ? `Bearer ${this.apiKey}` : this.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+      });
+      if (!response.ok) return [];
+      const payload = await response.json() as { data?: Array<{ id?: unknown }> };
+      const models = payload.data
+        ?.map((entry) => entry.id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      // Keep the gateway's own ordering: its first entry is the closest
+      // thing to a recommended default we have.
+      return models?.length ? [...new Set(models)] : [];
+    } catch {
+      return [];
+    }
   }
 
   private convertMessages(messages: LLMMessage[]): {
-    system?: string;
+    system?: AnthropicSystemBlock[];
     messages: AnthropicMessage[];
   } {
-    const systemMessages = messages.filter(m => m.role === 'system');
-    const system = systemMessages.map(m => typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')).join('\n\n') || undefined;
+    // One block per system message, boundaries preserved so a cache_control
+    // marker can sit exactly at the static/dynamic split. The '\n\n' joiner
+    // is PREPENDED to every block except the first, keeping the rendered
+    // prompt text byte-identical to the previous string-join behavior while
+    // keeping the first (cache-marked, static) block's bytes independent of
+    // whether a dynamic block follows - appending the separator instead
+    // would rewrite the cache entry whenever the dynamic message flips
+    // between empty and non-empty.
+    const systemTexts = messages
+      .filter(m => m.role === 'system')
+      .map(m => ({
+        text: typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n'),
+        cache: m.cache === true,
+      }))
+      .filter(m => m.text.length > 0); // Anthropic rejects empty text blocks
+
+    const lastMarked = this.promptCache
+      ? systemTexts.reduce((acc, m, idx) => (m.cache ? idx : acc), -1)
+      : -1;
+
+    const system: AnthropicSystemBlock[] | undefined = systemTexts.length > 0
+      ? systemTexts.map((m, idx) => ({
+          type: 'text' as const,
+          text: idx > 0 ? `\n\n${m.text}` : m.text,
+          ...(idx === lastMarked ? { cache_control: { type: 'ephemeral' as const } } : {}),
+        }))
+      : undefined;
 
     const anthropicMessages: AnthropicMessage[] = [];
     const nonSystem = messages.filter(m => m.role !== 'system');
@@ -394,6 +607,43 @@ export class AnthropicProvider implements LLMProvider {
     return { system, messages: anthropicMessages };
   }
 
+  /**
+   * Incremental conversation caching: mark the final content block of the
+   * last message so each request caches the entire rendered prefix
+   * (tools + system + all messages). Within a ReAct loop the prefix grows
+   * monotonically, so iteration N reads what iteration N-1 wrote.
+   *
+   * Only applied to conversational requests (at least one assistant turn
+   * present). One-shot calls (classification, extraction, summarization)
+   * never resend their prefix, so a breakpoint there would pay the 1.25x
+   * cache-write premium with zero reads.
+   *
+   * Mutates the converted messages in place. Together with the (single)
+   * system-block marker this emits at most 2 of the 4 allowed breakpoints.
+   */
+  private applyLastMessageBreakpoint(anthropicMessages: AnthropicMessage[]): void {
+    if (!this.promptCache) return;
+    if (!anthropicMessages.some(m => m.role === 'assistant')) return;
+    const last = anthropicMessages[anthropicMessages.length - 1];
+    if (!last) return;
+
+    if (typeof last.content === 'string') {
+      if (last.content.length === 0) return; // never emit empty text blocks
+      last.content = [{ type: 'text', text: last.content, cache_control: { type: 'ephemeral' } }];
+      return;
+    }
+    const lastBlock = last.content[last.content.length - 1];
+    if (!lastBlock) return;
+    // Copy-on-write: content arrays can be shared with the caller's message
+    // history (convertMessages passes them through by reference). Mutating in
+    // place would leak cache_control into the history and accumulate extra
+    // breakpoints on subsequent requests.
+    last.content = [
+      ...last.content.slice(0, -1),
+      { ...lastBlock, cache_control: { type: 'ephemeral' } },
+    ];
+  }
+
   private convertTools(tools: LLMTool[]): AnthropicToolDef[] {
     return tools.map(tool => ({
       name: tool.name,
@@ -424,6 +674,10 @@ export class AnthropicProvider implements LLMProvider {
       usage: {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        ...(response.usage.cache_read_input_tokens !== undefined
+          ? { cache_read_input_tokens: response.usage.cache_read_input_tokens } : {}),
+        ...(response.usage.cache_creation_input_tokens !== undefined
+          ? { cache_creation_input_tokens: response.usage.cache_creation_input_tokens } : {}),
       },
       model: response.model,
       finish_reason: this.mapStopReason(response.stop_reason),

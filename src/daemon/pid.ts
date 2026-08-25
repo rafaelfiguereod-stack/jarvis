@@ -24,33 +24,69 @@ import { cc } from 'bun:ffi';
 import flockSource from './flock.c' with { type: 'file' };
 
 const JARVIS_DIR = join(homedir(), '.jarvis');
-const LOG_DIR = join(JARVIS_DIR, 'logs');
-const LOCK_PATH = join(JARVIS_DIR, 'jarvis.pid');
-const LOG_PATH = join(LOG_DIR, 'jarvis.log');
 
 /**
- * Resolve the lock-file path for a given data dir. The daemon itself always
- * runs against `~/.jarvis` (no override path today), but the encryption
- * rotation script accepts `--data-dir` and needs to probe the lock for that
- * specific dir, not the default. Keep this in lock-step with `LOCK_PATH`
- * above: any change to the default lock-file name has to be reflected here.
+ * The daemon's own root: `JARVIS_HOME` when set (hosted wrappers export it for
+ * every jarvis invocation on an instance), `~/.jarvis` otherwise. The lock
+ * lives HERE — in the same root the daemon serves — so tools that probe "is a
+ * daemon running against this data dir" (restore, the rotation script) and the
+ * daemon itself can never disagree about which file to flock. Computed per
+ * call, not at module load, because config loading honors the same env var.
+ */
+function daemonRootDir(): string {
+  return process.env.JARVIS_HOME || JARVIS_DIR;
+}
+
+function defaultLockPath(): string {
+  return join(daemonRootDir(), 'jarvis.pid');
+}
+
+/**
+ * Resolve the lock-file path for a given data dir. With no argument this is
+ * the daemon's own lock path (JARVIS_HOME-aware, see `daemonRootDir`); the
+ * encryption rotation script passes an explicit `--data-dir` to probe the lock
+ * for that specific dir. Keep the file name in lock-step with
+ * `defaultLockPath` above.
  */
 export function lockPathFor(dataDir?: string): string {
-  if (!dataDir) return LOCK_PATH;
+  if (!dataDir) return defaultLockPath();
   return join(dataDir, 'jarvis.pid');
 }
 
 // ── flock() via Bun cc() ────────────────────────────────────────────
-// Compiled at startup by Bun's embedded TinyCC. Resolves libc via
-// system headers — works on Linux, macOS, and any POSIX platform
+// Compiled lazily on first use by Bun's embedded TinyCC. Resolves libc
+// via system headers — works on Linux, macOS, and any POSIX platform
 // without hardcoding a shared library path.
+//
+// Compilation is deferred (not run at module load) so that importing
+// this module's pure-fs helpers stays safe on platforms where the helper
+// can't be built. On native Windows the daemon is unsupported, and the C
+// source depends on POSIX headers that don't exist there — guarding here
+// surfaces a clear message instead of a low-level TinyCC header error.
 
-const { symbols: flock } = cc({
-  source: flockSource,
-  symbols: {
-    do_flock: { args: ['i32', 'i32'], returns: 'i32' },
-  },
-});
+type FlockSymbols = {
+  do_flock: (fd: number, operation: number) => number;
+};
+
+let flockSymbols: FlockSymbols | null = null;
+
+function getFlock(): FlockSymbols {
+  if (process.platform === 'win32') {
+    throw new Error(
+      'The JARVIS daemon is not compatible with native Windows. Use WSL2 or Docker.',
+    );
+  }
+  if (flockSymbols === null) {
+    const { symbols } = cc({
+      source: flockSource,
+      symbols: {
+        do_flock: { args: ['i32', 'i32'], returns: 'i32' },
+      },
+    });
+    flockSymbols = symbols as FlockSymbols;
+  }
+  return flockSymbols;
+}
 
 const LOCK_EX = 2;  // Exclusive lock
 const LOCK_NB = 4;  // Non-blocking
@@ -71,10 +107,14 @@ let lockFd: number | null = null;
  */
 export function acquireLock(pid: number): boolean {
   try {
-    mkdirSync(JARVIS_DIR, { recursive: true });
+    // Resolve the flock helper first so an unsupported platform fails before
+    // we create the data dir or open an fd (nothing to leak / clean up).
+    const flock = getFlock();
+
+    mkdirSync(daemonRootDir(), { recursive: true });
 
     // Open (or create) the lock file — don't truncate before locking
-    const fd = openSync(LOCK_PATH, constants.O_WRONLY | constants.O_CREAT, 0o644);
+    const fd = openSync(defaultLockPath(), constants.O_WRONLY | constants.O_CREAT, 0o644);
 
     // Try non-blocking exclusive lock
     const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
@@ -102,9 +142,9 @@ export function acquireLock(pid: number): boolean {
  *
  * Accepts an optional explicit `lockPath` to probe a non-default location
  * (used by the encryption rotation script when given `--data-dir`). The
- * default probes `~/.jarvis/jarvis.pid`.
+ * default probes the daemon's own lock path (JARVIS_HOME-aware).
  */
-export function isLocked(lockPath: string = LOCK_PATH): number | null {
+export function isLocked(lockPath: string = defaultLockPath()): number | null {
   if (!existsSync(lockPath)) return null;
 
   let fd: number;
@@ -116,10 +156,10 @@ export function isLocked(lockPath: string = LOCK_PATH): number | null {
 
   try {
     // Try non-blocking exclusive lock to probe
-    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    const result = getFlock().do_flock(fd, LOCK_EX | LOCK_NB);
     if (result === 0) {
       // Lock acquired — no daemon running. Release immediately.
-      flock.do_flock(fd, LOCK_UN);
+      getFlock().do_flock(fd, LOCK_UN);
       closeSync(fd);
       return null;
     }
@@ -132,7 +172,7 @@ export function isLocked(lockPath: string = LOCK_PATH): number | null {
     if (pid === 1 && isInsideContainer()) {
       // Only auto-release when probing the default daemon path. A custom
       // lockPath probe shouldn't be allowed to nuke an arbitrary file.
-      if (lockPath === LOCK_PATH) releaseLock();
+      if (lockPath === defaultLockPath()) releaseLock();
       return null;
     }
 
@@ -146,7 +186,7 @@ export function isLocked(lockPath: string = LOCK_PATH): number | null {
 /**
  * Acquire an exclusive lock at an arbitrary `lockPath`. Returns a handle that
  * releases the lock + unlinks the file. Distinct from `acquireLock`, which
- * always targets the default `~/.jarvis/jarvis.pid` and is only used by the
+ * always targets the daemon's own lock path and is only used by the
  * daemon itself. This helper exists for tests and tools (e.g. the rotation
  * script's test fixture) that need to simulate "a daemon is running against
  * this data dir" without colliding with a real daemon on the dev machine.
@@ -155,6 +195,7 @@ export function isLocked(lockPath: string = LOCK_PATH): number | null {
  */
 export function acquireLockAt(lockPath: string, pid: number): { release: () => void } | null {
   try {
+    const flock = getFlock();
     mkdirSync(join(lockPath, '..'), { recursive: true });
     const fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT, 0o644);
     const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
@@ -191,8 +232,62 @@ export function releaseLock(): void {
     lockFd = null;
   }
   try {
-    if (existsSync(LOCK_PATH)) unlinkSync(LOCK_PATH);
+    const lockPath = defaultLockPath();
+    if (existsSync(lockPath)) unlinkSync(lockPath);
   } catch { /* ignore */ }
+}
+
+/**
+ * Remove the lockfile ONLY if no process currently holds the flock.
+ * Returns true when the lock is free afterwards (cleared, or never there).
+ *
+ * Callers that stop the daemon need "is it safe to unlink this file", and
+ * neither `isProcessAlive` nor `isLocked` answers that correctly:
+ *
+ *  - a pid check misses a supervisor relaunch (launchd KeepAlive, systemd
+ *    Restart) that put a NEW process behind the same lock;
+ *  - `isLocked` returns null for "held but the pid is unreadable" — the lock
+ *    file is empty for an instant during acquireLock's truncate→write, and
+ *    unreadable entirely if it belongs to another user — which would read as
+ *    "free" and unlink a live holder's lock.
+ *
+ * This asks the only authoritative question (can I take the flock?) and does
+ * the unlink WHILE HOLDING it, so no acquirer can slip into the gap between
+ * the check and the removal.
+ */
+export function releaseLockIfUnheld(): boolean {
+  // We hold it ourselves — the normal release path already handles that.
+  if (lockFd !== null) {
+    releaseLock();
+    return true;
+  }
+
+  const lockPath = defaultLockPath();
+  if (!existsSync(lockPath)) return true;
+
+  let fd: number;
+  try {
+    fd = openSync(lockPath, constants.O_RDONLY);
+  } catch {
+    // Can't even open it (e.g. EACCES on another user's file) — treat as held,
+    // never as free.
+    return false;
+  }
+
+  try {
+    const flock = getFlock();
+    if (flock.do_flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+      closeSync(fd);
+      return false; // someone holds it
+    }
+    try { unlinkSync(lockPath); } catch { /* already gone */ }
+    flock.do_flock(fd, LOCK_UN);
+    closeSync(fd);
+    return true;
+  } catch {
+    try { closeSync(fd); } catch { /* already closed */ }
+    return false;
+  }
 }
 
 /**
@@ -203,7 +298,7 @@ export function releaseLock(): void {
  *   PID\nPORT      (current — PID on line 1, bound port on line 2)
  */
 export function readPid(): number | null {
-  return readPidAt(LOCK_PATH);
+  return readPidAt(defaultLockPath());
 }
 
 function readPidAt(lockPath: string): number | null {
@@ -224,9 +319,10 @@ function readPidAt(lockPath: string): number | null {
  * Returns null for legacy lock files that contain only a PID.
  */
 export function readLockedPort(): number | null {
-  if (!existsSync(LOCK_PATH)) return null;
+  const lockPath = defaultLockPath();
+  if (!existsSync(lockPath)) return null;
   try {
-    const content = readFileSync(LOCK_PATH, 'utf-8');
+    const content = readFileSync(lockPath, 'utf-8');
     const lines = content.split(/\r?\n/);
     const raw = lines[1]?.trim();
     if (!raw) return null;
@@ -262,22 +358,69 @@ export function writeLockedPort(port: number): void {
  * Get the lock file path (for display purposes).
  */
 export function getPidPath(): string {
-  return LOCK_PATH;
+  return defaultLockPath();
 }
 
 /**
  * Get the log file path. Creates the log directory if needed.
+ *
+ * JARVIS_HOME-aware, like the lock path above. These used to be module-level
+ * constants built from homedir() at import time, so on an instance that sets
+ * JARVIS_HOME the daemon locked one root and logged to a different one —
+ * `jarvis logs` then tailed a file the daemon wasn't writing.
  */
 export function getLogPath(): string {
-  mkdirSync(LOG_DIR, { recursive: true });
-  return LOG_PATH;
+  const dir = getLogDir();
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'jarvis.log');
 }
 
 /**
- * Get the log directory path.
+ * Get the log directory path. Resolved per call — see `daemonRootDir`.
  */
 export function getLogDir(): string {
-  return LOG_DIR;
+  return join(daemonRootDir(), 'logs');
+}
+
+/**
+ * Is `pid` still running?
+ *
+ * EPERM means the process EXISTS but isn't ours to signal (a daemon running as
+ * another user) — that is ALIVE. Only ESRCH means "no such process". Getting
+ * this backwards is dangerous: callers use it to decide whether it's safe to
+ * clear the lockfile, and reporting a live daemon as dead lets a second one
+ * start against the same data dir.
+ *
+ * Lives here, next to the lock, because every caller that asks "is the daemon
+ * alive" is really asking "is it safe to touch its lock" — and three separate
+ * copies of this check had already drifted apart.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+/**
+ * Poll until `pid` is gone, or the budget runs out. Returns true if it exited.
+ *
+ * Needed after SIGKILL: the signal returns before the kernel finishes tearing
+ * the process down, and a killed-but-unreaped zombie still answers kill(pid, 0).
+ */
+export async function waitForProcessExit(
+  pid: number,
+  timeoutMs: number,
+  pollIntervalMs = 50,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  return !isProcessAlive(pid);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

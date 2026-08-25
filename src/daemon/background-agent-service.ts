@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Service, ServiceStatus } from './services.ts';
 import type { IAgentService } from './agent-service-interface.ts';
+import { activeTurns } from './active-turns.ts';
 import type { JarvisConfig } from '../config/types.ts';
 import type { RoleDefinition } from '../roles/types.ts';
 import type { LLMManager } from '../llm/manager.ts';
@@ -26,7 +27,7 @@ import { BrowserController } from '../actions/browser/session.ts';
 import { DESKTOP_TOOLS } from '../actions/tools/desktop.ts';
 import { commitmentsTool } from '../actions/tools/commitments.ts';
 import { researchQueueTool } from '../actions/tools/research.ts';
-import { buildSystemPrompt, type PromptContext } from '../roles/prompt-builder.ts';
+import { buildSystemPromptParts, type PromptContext, type SystemPromptParts } from '../roles/prompt-builder.ts';
 import { getDueCommitments, getUpcoming } from '../vault/commitments.ts';
 import { getRecentObservations } from '../vault/observations.ts';
 import { findContent } from '../vault/content-pipeline.ts';
@@ -126,30 +127,40 @@ export class BackgroundAgentService implements Service, IAgentService {
    * Handle a reactive event message (from EventReactor / CommitmentExecutor).
    */
   async handleMessage(text: string, channel: string = 'system'): Promise<string> {
-    // Wait if busy — event reactor already has its own queue, so this is a safety net
-    const waitStart = Date.now();
-    while (this.busy && Date.now() - waitStart < 60_000) {
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    this.busy = true;
+    // Don't START a background reaction once draining; count it in-flight
+    // otherwise so the graceful drain awaits it too (same as the primary turns).
+    if (activeTurns.isDraining) return 'skipped: draining';
+    const endTurn = activeTurns.begin();
     try {
-      const systemPrompt = this.buildSystemPrompt(channel);
-      return await this.orchestrator.processMessage(systemPrompt, text);
-    } catch (err) {
-      console.error('[BackgroundAgent] Message error:', err);
-      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      // Wait if busy — event reactor already has its own queue, so this is a safety net
+      const waitStart = Date.now();
+      while (this.busy && Date.now() - waitStart < 60_000) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      this.busy = true;
+      try {
+        const systemPrompt = this.buildSystemPromptParts(channel);
+        return await this.orchestrator.processMessage(systemPrompt, text);
+      } catch (err) {
+        console.error('[BackgroundAgent] Message error:', err);
+        return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      } finally {
+        this.busy = false;
+      }
     } finally {
-      this.busy = false;
+      endTurn();
     }
   }
 
   // --- Private methods ---
 
-  private buildSystemPrompt(channel: string): string {
-    if (!this.role) return '';
+  private buildSystemPromptParts(_channel: string): SystemPromptParts {
+    if (!this.role) return { static: '', dynamic: '' };
     const context = this.buildPromptContext();
-    return buildSystemPrompt(this.role, context);
+    // Static role prefix is cache-marked downstream; the per-event context
+    // (current time, due commitments) rides on the dynamic half.
+    return buildSystemPromptParts(this.role, context);
   }
 
   private buildPromptContext(): PromptContext {

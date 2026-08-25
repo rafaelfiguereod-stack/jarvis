@@ -38,6 +38,9 @@ func platformOCR(imagePath string) (OCRResult, error) {
 		"-File", scriptFile,
 		"-Path", imagePath,
 	)
+	// Runs on every awareness OCR pass; without this it pops a console window
+	// each time on the GUI-subsystem build.
+	hideSubprocessWindow(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -53,13 +56,17 @@ func platformOCR(imagePath string) (OCRResult, error) {
 	var result struct {
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	// OCR text can contain raw control bytes that PowerShell's ConvertTo-Json
+	// leaves unescaped, producing invalid JSON — sanitize before decoding. Never
+	// log the raw output: it is the user's screen contents.
+	clean := sanitizeOCRJSON(stdout.Bytes())
+	if err := json.Unmarshal(clean, &result); err != nil {
 		// Surface stderr too — strict-mode failures may print there even on exit 0.
 		details := strings.TrimSpace(stderr.String())
 		if details != "" {
 			return OCRResult{}, fmt.Errorf("decode ocr output (%s): %w", details, err)
 		}
-		return OCRResult{}, fmt.Errorf("decode ocr output: %w (raw: %q)", err, stdout.String())
+		return OCRResult{}, fmt.Errorf("decode ocr output: %w (%d bytes)", err, len(clean))
 	}
 
 	return OCRResult{

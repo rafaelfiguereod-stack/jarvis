@@ -20,6 +20,12 @@ func CheckCapabilities(cfg *SidecarConfig) (available []SidecarCapability, unava
 			// Pure Go — always available
 		case CapClipboard:
 			reason = checkClipboard()
+		case CapFileWatch:
+			// Pure-Go polling watcher — always available.
+		case CapProcesses:
+			reason = checkProcesses()
+		case CapNotifications:
+			reason = checkNotifications()
 		case CapScreenshot:
 			reason = checkScreenshot()
 		case CapAwareness:
@@ -30,6 +36,17 @@ func CheckCapabilities(cfg *SidecarConfig) (available []SidecarCapability, unava
 			reason = checkBrowser(cfg)
 		case CapDesktop:
 			reason = checkDesktop()
+		case CapWindows:
+			// Native panel windows (webview-backed). The runtime check is
+			// effectively "do we have a webview lib at runtime?" which we
+			// can't probe statically without trying to spawn a window.
+			// Spawning fails gracefully via the RPC layer, so accept here.
+		case CapPebble:
+			// Native pebble overlay (GDI+/Cocoa/Cairo, per-platform). On
+			// non-Windows the implementation is currently stubbed and Spawn()
+			// returns an error — the daemon handles that gracefully via the
+			// dispatch.  Accept the capability either way so the brain knows
+			// it was advertised.
 		}
 		if reason != "" {
 			unavailable = append(unavailable, UnavailableCapability{Name: cap, Reason: reason})

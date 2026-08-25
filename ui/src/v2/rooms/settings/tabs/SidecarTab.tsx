@@ -1,5 +1,7 @@
 import React, { useState } from "react";
+import { createPortal } from "react-dom";
 import type { SettingsHook } from "../useSettingsData";
+import { confirmDialog } from "../../../ui/ConfirmDialog";
 // Embed the legacy config editor — it's a 200+ LOC YAML+form editor with
 // its own modal chrome; rebuilding pixel-perfect adds a lot of LOC for a
 // power-user surface. The retheme cascade on .v2-set__legacy-embed
@@ -35,13 +37,19 @@ export function SidecarTab({
   };
 
   const handleRevoke = async (id: string, name: string) => {
-    if (!confirm(`Revoke sidecar "${name}"? It will lose access to Jarvis.`)) return;
+    if (!await confirmDialog(`Revoke sidecar "${name}"? It will lose access to Jarvis.`)) return;
     const r = await data.revokeSidecar(id);
     onToast(r.message, r.ok ? "ok" : "warn");
   };
 
   const copyToken = () => {
     if (!enrollResult) return;
+    // navigator.clipboard is undefined outside secure contexts (plain-HTTP
+    // LAN dashboards), which would throw synchronously and skip the toast.
+    if (!navigator.clipboard) {
+      onToast("Clipboard unavailable over HTTP — select the token manually.", "warn");
+      return;
+    }
     navigator.clipboard.writeText(enrollResult.token).then(
       () => onToast("Token copied to clipboard.", "ok"),
       () => onToast("Copy failed — select manually.", "warn"),
@@ -87,7 +95,7 @@ export function SidecarTab({
               Token for "{enrollResult.name}" — copy now, this is shown only once
             </div>
             <code className="v2-set__code v2-set__code--block">
-              jarvis-sidecar --token {enrollResult.token}
+              jarvis --token {enrollResult.token}
             </code>
             <div style={{ display: "flex", gap: "var(--s-2)", justifyContent: "flex-end" }}>
               <button type="button" className="v2-set__btn" onClick={copyToken}>
@@ -133,6 +141,21 @@ export function SidecarTab({
                 <div className="v2-set__sidecar-meta">
                   {sc.hostname && <span>{sc.hostname}</span>}
                   {sc.os && sc.platform && <span>· {sc.os}/{sc.platform}</span>}
+                  {sc.version && (
+                    <span>
+                      · v{sc.version}
+                      {sc.update_status === "suggested" && (
+                        <span style={{ color: "var(--warn)" }} title="A newer sidecar is recommended for this brain">
+                          {" "}· update available
+                        </span>
+                      )}
+                      {sc.update_status === "dev" && (
+                        <span style={{ opacity: 0.6 }} title="Unstamped local dev build — never version-blocked">
+                          {" "}· dev build
+                        </span>
+                      )}
+                    </span>
+                  )}
                   {sc.capabilities && sc.capabilities.length > 0 && (
                     <span>· {sc.capabilities.join(", ")}</span>
                   )}
@@ -175,8 +198,13 @@ export function SidecarTab({
         )}
       </section>
 
-      {/* Legacy config editor modal — rethemed via cascade */}
-      {configTarget && (
+      {/* Legacy config editor modal — rethemed via cascade. Portaled to
+          <body> because .v2-set is a container-query container, which makes
+          it the containing block + stacking context for the editor's
+          `position: fixed` overlay; mounted in place, the overlay would
+          cover only the Settings room. The wrapper travels with it so the
+          --j-* cascade still applies. */}
+      {configTarget && createPortal(
         <div className="v2-set__legacy-embed">
           <SidecarConfigEditor
             sidecarId={configTarget.id}
@@ -186,7 +214,8 @@ export function SidecarTab({
             }
             onClose={() => setConfigTarget(null)}
           />
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

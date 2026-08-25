@@ -7,6 +7,7 @@ export type LLMMessage = {
   content: string | ContentBlock[];
   tool_calls?: LLMToolCall[];   // present on assistant messages with tool use
   tool_call_id?: string;        // present on tool result messages
+  cache?: boolean;              // marks a stable prompt-cache boundary. Only honored on SYSTEM messages (Anthropic puts a cache_control breakpoint on the marked block); conversation-history caching is automatic via the provider's last-message breakpoint. Providers without explicit prompt caching ignore it.
 };
 
 export type LLMTool = {
@@ -24,7 +25,15 @@ export type LLMToolCall = {
 export type LLMResponse = {
   content: string;
   tool_calls: LLMToolCall[];
-  usage: { input_tokens: number; output_tokens: number };
+  usage: {
+    // Normalized across providers: input_tokens counts only UNCACHED prompt
+    // tokens (billed at full price). The full prompt size is
+    // input_tokens + cache_read_input_tokens + cache_creation_input_tokens.
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;      // tokens served from provider prompt cache (~0.1x on Anthropic, 0.5x on OpenAI)
+    cache_creation_input_tokens?: number;  // tokens written to provider prompt cache (1.25x on Anthropic; always 0 on OpenAI)
+  };
   model: string;
   finish_reason: 'stop' | 'tool_use' | 'length' | 'error';
 };
@@ -34,7 +43,8 @@ export type LLMResponse = {
  * user-facing copy without string-matching the upstream error message.
  */
 export type LLMErrorCode =
-  | 'auth'         // invalid API key, unauthorized
+  | 'auth'         // 401, invalid or missing API key
+  | 'forbidden'    // 403, credentials accepted but this model/endpoint is not allowed
   | 'rate_limit'   // 429, quota exhausted
   | 'network'      // timeout, connection refused, 502/503/504
   | 'bad_request'  // 400/422, invalid parameters
@@ -43,10 +53,30 @@ export type LLMErrorCode =
   | 'unknown';
 
 export type LLMStreamEvent =
-  | { type: 'text'; text: string }
+  /**
+   * `segmentEnd` marks the text as a finished, speakable unit — set by
+   * orchestrators when an acknowledgment is complete and slow tool work is
+   * about to start. Consumers use it to flush a pending TTS sentence instead
+   * of inferring completion from punctuation in a partial token buffer.
+   * Providers never set it; the text may be empty when the signal is all the
+   * producer has to say.
+   */
+  | { type: 'text'; text: string; segmentEnd?: boolean }
   | { type: 'tool_call'; tool_call: LLMToolCall }
   | { type: 'done'; response: LLMResponse }
-  | { type: 'error'; error: string; code?: LLMErrorCode };
+  | { type: 'error'; error: string; code?: LLMErrorCode; retry_after_ms?: number };
+
+/** HTTP-aware provider failure used to carry Retry-After into the router. */
+export class LLMProviderError extends Error {
+  constructor(
+    message: string,
+    readonly code: LLMErrorCode,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = 'LLMProviderError';
+  }
+}
 
 /**
  * Map an HTTP status code returned by a provider to a canonical error code.
@@ -54,8 +84,12 @@ export type LLMStreamEvent =
  * UI doesn't have to guess from the error string.
  */
 export function classifyHttpStatus(status: number): LLMErrorCode {
-  if (status === 401 || status === 403) return 'auth';
+  if (status === 401) return 'auth';
+  if (status === 403) return 'forbidden';
   if (status === 429) return 'rate_limit';
+  // Some OpenAI-compatible gateways use non-standard 498 for an upstream
+  // connection/token expiry and expect clients to retry it as a network fault.
+  if (status === 498) return 'network';
   if (status === 404) return 'not_found';
   if (status === 400 || status === 422) return 'bad_request';
   if (status === 502 || status === 503 || status === 504) return 'network';
@@ -71,12 +105,26 @@ export function classifyHttpStatus(status: number): LLMErrorCode {
 export function classifyErrorString(raw: string | undefined | null): LLMErrorCode {
   if (!raw) return 'unknown';
   const s = raw.toLowerCase();
+  // 403 and 401 need different advice (no model access vs. a bad key), so the
+  // authoritative markers for a permission failure are checked first. The
+  // softer permission wording is checked *after* auth, because providers mix
+  // it into 401 bodies too and a stated 401 is the better signal.
   if (
-    /\b401\b/.test(s) || /\b403\b/.test(s) ||
+    /\b403\b/.test(s) ||
+    s.includes('forbidden') ||
+    s.includes('permission_error') || s.includes('permission_denied')
+  ) return 'forbidden';
+  if (
+    /\b401\b/.test(s) ||
     s.includes('unauthorized') || s.includes('api key') ||
     s.includes('invalid_api_key') || s.includes('invalid x-api-key') ||
     s.includes('authentication')
   ) return 'auth';
+  // "not have access" covers both wordings providers use ("you do not have
+  // access to model X", "project ... does not have access to model X").
+  if (
+    s.includes('permission denied') || s.includes('not have access')
+  ) return 'forbidden';
   if (
     /\b429\b/.test(s) ||
     s.includes('rate limit') || s.includes('too many requests') ||

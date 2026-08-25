@@ -38,19 +38,62 @@ console.log(config.personality.core_traits);  // string[]
 
 ### Saving Configuration
 
-```typescript
-import { saveConfig } from './config/index.ts';
+There is intentionally **no `saveConfig`**. `config.yaml` is a read-only
+SYSTEM config (daemon.*, auth, google, usejarvis_ai) that the brain never
+writes; in hosted mode it is root-owned and managed by the hosting server.
 
-// Modify config
-config.daemon.port = 8888;
-config.llm.primary = 'openai';
+### The `usejarvis_ai` block (hosted installs only)
 
-// Save to default location
-await saveConfig(config);
+Written exclusively by the hosting provisioner — never by the daemon, the
+dashboard, or the user:
 
-// Save to custom path
-await saveConfig(config, '/path/to/config.yaml');
+```yaml
+usejarvis_ai:
+  base_url: "https://llm.usejarvis.host/v1"   # quote both values: unquoted
+  api_key: "sk-uj-..."                        # scalars parse as non-strings
 ```
+
+Ownership and semantics:
+
+- **File-authoritative.** The block is re-read on SIGHUP and
+  `POST /api/config/reload` (`reloadUsejarvisAiBlock`), so a key rotation
+  takes effect without a restart. Removing the block un-hosts the install on
+  the next reload/boot; a corrupt file keeps the current in-memory value.
+- **File mode.** The block carries a per-account API key: the file should be
+  root-owned and not world-readable (`0600`, owner the daemon's service
+  account or root with a read grant).
+- **Never persisted.** The injected `usejarvis_ai` provider entry is excluded
+  from every DB write (`stripSecretsFromProviders`) and the dashboard cannot
+  edit or delete it (`saveLLMSettings` refuses the reserved name on hosted
+  installs).
+- **Malformed values** (non-string `base_url`/`api_key`, e.g. unquoted
+  scalars) are warned about and treated as an absent block — the daemon still
+  boots.
+
+All user-owned sections (personality, voice, stt/tts, authority, channels,
+onboarding, ... — see `USER_OWNED_SECTIONS` in `types.ts`) persist to the
+vault DB settings store instead:
+
+```typescript
+import { saveUserSection, persistUserPatch } from '../daemon/user-settings.ts';
+
+// Most sections: mutate in memory, then persist the section.
+config.personality = { ...config.personality, humor: 'dry' };
+saveUserSection('personality', config.personality);
+
+// stt/tts are the exception: persist the PATCH, never the merged in-memory
+// section — the in-memory value carries DEFAULT_CONFIG fills (provider
+// 'openai'/'edge'), and saving those records a provider choice the user never
+// made, which defeats the hosted "silent user gets the included voice"
+// default. persistUserPatch merges the patch over the stored row (hydrated
+// with keychain credentials) and saves that.
+config.tts = { ...config.tts, enabled: true };
+persistUserPatch('tts', { enabled: true });
+```
+
+A legacy `config.yaml` that still carries user sections seeds the DB once at
+daemon boot (`importLegacyUserSettings`), after which the file's copies are
+ignored (`loadConfig` discards them, exactly like the `llm` block).
 
 ### Using Default Config
 
@@ -72,6 +115,7 @@ daemon: {
   port: number;          // WebSocket server port (default: 7777)
   data_dir: string;      // Data directory path (default: ~/.jarvis)
   db_path: string;       // SQLite database path (default: ~/.jarvis/jarvis.db)
+  public_url?: string;   // Public HTTPS origin behind a reverse proxy
 }
 ```
 
@@ -156,6 +200,7 @@ daemon:
   port: 7777
   data_dir: "~/.jarvis"
   db_path: "~/.jarvis/jarvis.db"
+  # public_url: "https://jarvis.example.com"
 
 llm:
   primary: "anthropic"
@@ -243,22 +288,18 @@ console.log(`Database path: ${config.daemon.db_path}`);
 
 ### Dynamic Configuration Updates
 
+Inside the daemon, mutate the live in-memory config (it is the DB-merged,
+authoritative view) and persist the touched section:
+
 ```typescript
-import { loadConfig, saveConfig } from './config/index.ts';
+import { saveUserSection } from '../daemon/user-settings.ts';
 
-// Load current config
-const config = await loadConfig();
-
-// Update settings
-config.daemon.port = 8888;
-config.llm.primary = 'openai';
-config.personality.core_traits.push('humorous');
-
-// Save changes
-await saveConfig(config);
-
-console.log('Configuration updated!');
+ctx.config.personality.core_traits.push('humorous');
+saveUserSection('personality', ctx.config.personality);
 ```
+
+System keys (`daemon.*`) cannot be changed at runtime — edit `config.yaml`
+and restart (self-host), or let the hosting server rewrite it (hosted).
 
 ## Setup Instructions
 

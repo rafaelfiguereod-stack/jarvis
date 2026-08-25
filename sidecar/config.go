@@ -11,8 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var configDir = filepath.Join(homeDir(), ".jarvis-sidecar")
-var configFile = filepath.Join(configDir, "config.yaml")
+// The sidecar shares the ~/.jarvis data folder with the brain (they rarely run
+// on the same host); its files are named distinctly so they can't collide with
+// brain files (jarvis.pid, sidecar-keys/, the db, etc.). captures/ is shared.
+var configDir = filepath.Join(homeDir(), ".jarvis")
+var configFile = filepath.Join(configDir, "sidecar.yaml")
 
 func homeDir() string {
 	h, err := os.UserHomeDir()
@@ -25,7 +28,8 @@ func homeDir() string {
 func defaultConfig() SidecarConfig {
 	return SidecarConfig{
 		Capabilities: []SidecarCapability{
-			CapTerminal, CapFilesystem, CapClipboard, CapScreenshot, CapSystemInfo, CapAwareness, CapDesktop, CapBrowser, CapOCR,
+			CapTerminal, CapFilesystem, CapClipboard, CapScreenshot, CapSystemInfo, CapAwareness, CapDesktop, CapBrowser, CapOCR, CapWindows, CapPebble, CapSubPebble,
+			CapFileWatch, CapProcesses, CapNotifications,
 		},
 		Terminal: TerminalConfig{
 			BlockedCommands: []string{},
@@ -76,6 +80,20 @@ func LoadConfig() (*SidecarConfig, error) {
 	}
 	if len(cfg.Capabilities) == 0 {
 		cfg.Capabilities = defaultConfig().Capabilities
+	} else {
+		// Merge in any default capabilities that aren't already present in the
+		// saved config. This makes new capabilities (e.g. CapWindows added in
+		// Phase 2) auto-enable on existing installs without requiring users to
+		// hand-edit ~/.jarvis-sidecar/config.yaml.
+		have := make(map[SidecarCapability]bool, len(cfg.Capabilities))
+		for _, c := range cfg.Capabilities {
+			have[c] = true
+		}
+		for _, c := range defaultConfig().Capabilities {
+			if !have[c] {
+				cfg.Capabilities = append(cfg.Capabilities, c)
+			}
+		}
 	}
 
 	// Awareness defaults

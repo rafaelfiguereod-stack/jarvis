@@ -312,9 +312,20 @@ export async function runUpdate(deps: UpdateDeps): Promise<UpdateResult> {
   const checkRunning = deps.checkRunning ?? isLocked;
   const stopDaemon = deps.stopDaemon ?? (() => stopDaemonGracefully());
   const runningPid = checkRunning();
+  // `stopped: false` means the process survived both signals (e.g. it belongs
+  // to another user). Tracked out here because the restart at the end must not
+  // fire against a daemon that is still holding the lock.
+  let daemonStopped = true;
   if (runningPid) {
     console.log(c.dim(`  Stopping daemon (PID ${runningPid}) before update...`));
-    await stopDaemon();
+    const stop = await stopDaemon();
+    if (stop && stop.stopped === false) {
+      daemonStopped = false;
+      // isLocked(), not stop.pid: under a supervisor the pid we signalled IS
+      // gone and a NEW daemon holds the lock — naming the dead one misleads.
+      const holder = isLocked() ?? stop.pid;
+      console.log(c.yellow(`  Warning: daemon (PID ${holder}) is still running — update may not take effect until it restarts.`));
+    }
   }
 
   let result: UpdateResult;
@@ -334,8 +345,17 @@ export async function runUpdate(deps: UpdateDeps): Promise<UpdateResult> {
   }
 
   if (runningPid && result.outcome !== 'failed' && restart) {
-    console.log(c.dim('\nRestarting daemon...'));
-    restartDaemonDetached(deps.packageRoot);
+    if (daemonStopped) {
+      console.log(c.dim('\nRestarting daemon...'));
+      restartDaemonDetached(deps.packageRoot);
+    } else {
+      // The old daemon still holds the lock, so a spawned replacement would
+      // fail acquireLock() and die into the log while the user reads
+      // "Restarting daemon..." followed by "✓ Updated".
+      const holder = isLocked() ?? runningPid;
+      console.log(c.yellow('\nSkipping restart — a daemon is still running.'));
+      console.log(c.dim(`  Stop PID ${holder} and run \`jarvis start\` to pick up the update.`));
+    }
   }
 
   return result;

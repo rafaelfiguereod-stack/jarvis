@@ -7,14 +7,18 @@ export {
   OpenAIWhisperSTT,
   GroqWhisperSTT,
   LocalWhisperSTT,
+  UsejarvisSTT,
+  UsejarvisTTS,
   EdgeTTSProvider,
   ElevenLabsTTSProvider,
   createSTTProvider,
   createTTSProvider,
   listElevenLabsVoices,
+  sniffAudioFormat,
   splitIntoSentences,
   type STTProvider,
   type TTSProvider,
+  type HostedVoiceCredentials,
 } from './voice.ts';
 
 // Channel adapters
@@ -25,7 +29,9 @@ export {
   type ChannelAdapter,
 } from './channels/telegram.ts';
 export { WhatsAppAdapter } from './channels/whatsapp.ts';
-export { DiscordAdapter } from './channels/discord.ts';
+// DiscordAdapter is deliberately NOT re-exported here: discord.js costs
+// ~38MB RSS at import time. Import it lazily from './channels/discord.ts'
+// only when the Discord channel is enabled.
 export { SignalAdapter } from './channels/signal.ts';
 
 // Channel Manager
@@ -100,6 +106,17 @@ export class ChannelManager {
     );
 
     console.log('[ChannelManager] All channels disconnected');
+  }
+
+  /**
+   * Remove every registered adapter. Callers must disconnectAll() first —
+   * this only drops the references so a later register/connect cycle starts
+   * from a clean slate. Without it, an adapter for a channel the user just
+   * DISABLED would survive in the map and connectAll() would happily
+   * reconnect it with the old token/allowlist.
+   */
+  unregisterAll(): void {
+    this.channels.clear();
   }
 
   /**

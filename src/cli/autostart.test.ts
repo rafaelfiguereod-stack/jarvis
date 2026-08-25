@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import {
   canUseSystemdUserService,
+  generateLaunchdPlist,
+  generateSystemdUnit,
   decodeLaunchctlOutput,
   isLaunchdAlreadyLoaded,
   probeSystemdUserService,
@@ -198,5 +203,95 @@ describe('decodeLaunchctlOutput', () => {
 
   test('returns empty string for undefined', () => {
     expect(decodeLaunchctlOutput(undefined)).toBe('');
+  });
+});
+
+// ── Service definitions carry the data root ──────────────────────────
+//
+// The daemon resolves its lock AND its logs through JARVIS_HOME. A service
+// definition that doesn't export the var launches a daemon under ~/.jarvis
+// while every CLI tool in the same shell looks under $JARVIS_HOME.
+describe('service definitions propagate JARVIS_HOME', () => {
+  function withJarvisHome<T>(value: string | undefined, fn: () => T): T {
+    const prev = process.env.JARVIS_HOME;
+    if (value === undefined) delete process.env.JARVIS_HOME;
+    else process.env.JARVIS_HOME = value;
+    try { return fn(); } finally {
+      if (prev === undefined) delete process.env.JARVIS_HOME;
+      else process.env.JARVIS_HOME = prev;
+    }
+  }
+
+  test('systemd unit omits JARVIS_HOME when unset', () => {
+    const unit = withJarvisHome(undefined, generateSystemdUnit);
+    expect(unit).not.toContain('JARVIS_HOME');
+    expect(unit).toContain('[Install]');
+    expect(unit).toContain('Environment=HOME=');
+  });
+
+  test('systemd unit exports JARVIS_HOME when set', () => {
+    const unit = withJarvisHome('/srv/tenant7', generateSystemdUnit);
+    expect(unit).toContain('Environment="JARVIS_HOME=/srv/tenant7"');
+    // The section header must not get swallowed by the injected line.
+    expect(unit).toContain('[Install]');
+    expect(unit).toContain('WantedBy=default.target');
+  });
+
+  test('launchd plist logs under JARVIS_HOME and exports it', () => {
+    const plist = withJarvisHome('/srv/tenant7', generateLaunchdPlist);
+    expect(plist).toContain('<string>/srv/tenant7/logs/jarvis.log</string>');
+    expect(plist).toContain('<key>JARVIS_HOME</key>');
+    expect(plist).toContain('<string>/srv/tenant7</string>');
+  });
+
+  test('launchd plist falls back to ~/.jarvis/logs with no JARVIS_HOME', () => {
+    const plist = withJarvisHome(undefined, generateLaunchdPlist);
+    expect(plist).toContain('/.jarvis/logs/jarvis.log');
+    expect(plist).not.toContain('JARVIS_HOME');
+  });
+
+  // systemd splits an unquoted Environment= on whitespace and reads % as a
+  // specifier introducer. Either would truncate the path and put the daemon on
+  // a different root than the CLI — the split this line exists to close.
+  test('systemd quotes a data root containing spaces and escapes %', () => {
+    const unit = withJarvisHome('/srv/my data/100%', generateSystemdUnit);
+    expect(unit).toContain('Environment="JARVIS_HOME=/srv/my data/100%%"');
+  });
+
+  // An unescaped & or < yields a plist launchctl refuses to load, so autostart
+  // silently does nothing.
+  test('launchd plist XML-escapes the data root', () => {
+    const plist = withJarvisHome('/srv/a&b/<c>', generateLaunchdPlist);
+    expect(plist).toContain('<string>/srv/a&amp;b/&lt;c&gt;</string>');
+    expect(plist).not.toContain('/srv/a&b/<c>');
+  });
+
+  // ── The generated files must be valid to the tools that consume them ──
+  //
+  // "contains the right substring" is not enough: systemd and launchctl reject
+  // malformed input, and a rejected service definition means autostart quietly
+  // does nothing.
+
+  const SYSTEMD_ANALYZE = Bun.which('systemd-analyze');
+  test.skipIf(!SYSTEMD_ANALYZE)('systemd-analyze accepts the generated unit', () => {
+    const unit = withJarvisHome('/srv/my data/100%', generateSystemdUnit);
+    const path = join(mkdtempSync(join(tmpdir(), 'jarvis-unit-')), 'jarvis-verify.service');
+    writeFileSync(path, unit, 'utf-8');
+    const r = Bun.spawnSync([SYSTEMD_ANALYZE!, 'verify', path], { stdout: 'pipe', stderr: 'pipe' });
+    const out = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
+    expect({ code: r.exitCode, out }).toEqual({ code: 0, out: '' });
+  });
+
+  // plutil is macOS-only; xmllint covers well-formedness everywhere else.
+  const PLIST_LINT = Bun.which('plutil') ?? Bun.which('xmllint');
+  test.skipIf(!PLIST_LINT)('the generated plist parses with a hostile data root', () => {
+    const plist = withJarvisHome('/srv/a&b/<c>/"d"', generateLaunchdPlist);
+    const path = join(mkdtempSync(join(tmpdir(), 'jarvis-plist-')), 'jarvis.plist');
+    writeFileSync(path, plist, 'utf-8');
+    const cmd = PLIST_LINT!.endsWith('plutil')
+      ? [PLIST_LINT!, '-lint', path]
+      : [PLIST_LINT!, '--noout', path];
+    const r = Bun.spawnSync(cmd, { stdout: 'pipe', stderr: 'pipe' });
+    expect({ code: r.exitCode, err: r.stderr.toString().trim() }).toEqual({ code: 0, err: '' });
   });
 });

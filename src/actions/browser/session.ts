@@ -11,6 +11,7 @@
 import { CDPClient } from './cdp.ts';
 import { STEALTH_SCRIPT } from './stealth.ts';
 import { launchChrome, stopChrome, type RunningBrowser } from './chrome-launcher.ts';
+import { parseKeyCombo, SUPPORTED_KEYS_HINT } from './keys.ts';
 
 export type PageElement = {
   id: number;
@@ -26,7 +27,11 @@ export type PageSnapshot = {
   elements: PageElement[];
 };
 
-// JS function injected into the page to extract interactive elements
+// JS function injected into the page to extract interactive elements.
+// Traverses same-origin iframes (Google Docs, Gmail compose, embedded
+// editors) with click coordinates offset to top-page space. Cross-origin
+// frames are skipped (contentDocument is inaccessible). Mirrored in the Go
+// sidecar (sidecar/browser_snapshot.go) — change both together.
 const SNAPSHOT_SCRIPT = `(() => {
   const els = [];
   const seen = new WeakSet();
@@ -38,44 +43,81 @@ const SNAPSHOT_SCRIPT = `(() => {
     '[onclick]', '[contenteditable="true"]', '[tabindex="0"]',
     '[data-testid]'
   ].join(', ');
-  document.querySelectorAll(sel).forEach((el) => {
-    // Skip duplicates (child of already-captured parent)
-    if (seen.has(el)) return;
-    seen.add(el);
 
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-    if (rect.width < 5 || rect.height < 5) return;
-    const style = window.getComputedStyle(el);
-    if (style.visibility === 'hidden') return;
-    if (style.display === 'none') return;
-    if (style.opacity === '0') return;
-
-    const tag = el.tagName.toLowerCase();
-    const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 100);
-    const attrs = {};
-    for (const a of ['href', 'name', 'placeholder', 'type', 'aria-label', 'title', 'id', 'role', 'data-testid', 'contenteditable']) {
-      const v = el.getAttribute(a);
-      if (v) attrs[a] = v.slice(0, 200);
+  // Collect same-origin documents: the top document plus nested iframes,
+  // each with the cumulative offset of its viewport in top-page coordinates.
+  const frames = [];
+  const collectFrames = (doc, ox, oy, depth) => {
+    frames.push({ doc, ox, oy });
+    if (depth >= 3 || frames.length >= 10) return;
+    for (const f of doc.querySelectorAll('iframe, frame')) {
+      let child = null;
+      try { child = f.contentDocument; } catch { continue; }
+      if (!child) continue;
+      const r = f.getBoundingClientRect();
+      collectFrames(child, ox + r.x, oy + r.y, depth + 1);
     }
-    // Capture live value (JS property) for inputs — getAttribute('value') returns the HTML default
-    if ('value' in el && el.value) attrs.value = String(el.value).slice(0, 200);
-    els.push({
-      _el: el,
-      tag,
-      text,
-      attrs,
-      x: Math.round(rect.x + rect.width / 2),
-      y: Math.round(rect.y + rect.height / 2)
+  };
+  collectFrames(document, 0, 0, 0);
+
+  for (const frame of frames) {
+    const doc = frame.doc;
+    const win = doc.defaultView || window;
+    const inFrame = doc !== document;
+    doc.querySelectorAll(sel).forEach((el) => {
+      // Skip duplicates (child of already-captured parent)
+      if (seen.has(el)) return;
+      seen.add(el);
+
+      const rect = el.getBoundingClientRect();
+      const isTypingTarget = el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox';
+      const style = win.getComputedStyle(el);
+      if (style.display === 'none') return;
+      if (isTypingTarget) {
+        // Keep typing targets even when tiny, clipped, or transparent —
+        // editors (Google Docs) hide their real input in an offscreen iframe.
+      } else {
+        if (rect.width === 0 || rect.height === 0) return;
+        if (rect.width < 5 || rect.height < 5) return;
+        if (style.visibility === 'hidden') return;
+        if (style.opacity === '0') return;
+      }
+
+      const tag = el.tagName.toLowerCase();
+      const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 100);
+      const attrs = {};
+      for (const a of ['href', 'name', 'placeholder', 'type', 'aria-label', 'title', 'id', 'role', 'data-testid', 'contenteditable']) {
+        const v = el.getAttribute(a);
+        if (v) attrs[a] = v.slice(0, 200);
+      }
+      // Capture live value (JS property) for inputs — getAttribute('value') returns the HTML default
+      if ('value' in el && el.value) attrs.value = String(el.value).slice(0, 200);
+      if (inFrame) attrs.iframe = 'true';
+      els.push({
+        _el: el,
+        tag,
+        text,
+        attrs,
+        x: Math.round(frame.ox + rect.x + rect.width / 2),
+        y: Math.round(frame.oy + rect.y + rect.height / 2)
+      });
     });
-  });
+  }
 
   // Assign sequential IDs and store DOM refs for later direct focus
   window.__jarvis_elements = els.map(e => e._el);
   els.forEach((el, i) => { el.id = i + 1; delete el._el; });
 
-  // Get visible text, clean up whitespace
-  let bodyText = document.body.innerText || '';
+  // Get visible text (top document first, then same-origin frames), clean up whitespace.
+  // document.body can be null on challenge/error pages (WAF "checking your browser"
+  // interstitials) — guard so the snapshot returns empty text instead of throwing,
+  // which lets callers detect the bot-wall rather than seeing an opaque error.
+  let bodyText = (document.body && document.body.innerText) || '';
+  for (const frame of frames) {
+    if (frame.doc === document) continue;
+    const t = frame.doc.body && frame.doc.body.innerText;
+    if (t && t.trim()) bodyText += '\\n' + t;
+  }
   bodyText = bodyText.replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 8000);
 
   return {
@@ -121,6 +163,16 @@ export class BrowserController {
    */
   async connect(): Promise<void> {
     if (this._connected) return;
+
+    // browser.local: false is enforced HERE, not only in launchChrome:
+    // connect() first probes the CDP port and attaches to whatever is
+    // already listening, so on a shared host a guard on launch alone would
+    // let the agent adopt ANY process bound to 127.0.0.1:<port> - including
+    // another tenant's. No local CDP connection at all when disabled.
+    const { isLocalBrowserDisabled } = await import('../tools/local-tools-guard.ts');
+    if (isLocalBrowserDisabled()) {
+      throw new Error('The local browser is disabled on this machine (browser.local: false). Use a sidecar browser instead.');
+    }
 
     // If Chrome isn't running, launch it automatically
     if (!(await this.isAvailable())) {
@@ -191,10 +243,76 @@ export class BrowserController {
       console.warn(`[BrowserController] Page load timeout for ${url}, continuing anyway`);
     }
 
-    // Wait for JS to settle
-    await Bun.sleep(800);
+    await this.waitForSettled();
 
     return this.snapshot();
+  }
+
+  /**
+   * Wait for the document to stop changing, bounded.
+   *
+   * This replaces a flat `Bun.sleep(800)`. That sleep was wrong in both
+   * directions: on a static page it burned 800ms doing nothing, and on a loaded
+   * machine — or when the load-event wait above timed out and we continued
+   * anyway — 800ms wasn't enough, so callers got a snapshot of a page whose
+   * scripts hadn't run yet (missing elements, unattached listeners).
+   *
+   * Polls readyState plus the element count and returns as soon as two
+   * consecutive samples agree, so the common case is FASTER than the old sleep
+   * while a slow page gets up to `maxMs`.
+   *
+   * A failed sample is RETRIED rather than treated as terminal. Chrome rejects
+   * Runtime.evaluate with "Cannot find context with specified id" while the
+   * execution context is being swapped — i.e. exactly during the navigation we
+   * are waiting on. Bailing on the first such error would end the wait after a
+   * single tick and hand back a page whose scripts have not run, which is worse
+   * than the flat sleep this replaced. Only a sustained run of failures (a
+   * crashed tab, a closed target) ends the wait early.
+   */
+  private async waitForSettled(maxMs = 3000, intervalMs = 150, minSettleMs = 800): Promise<void> {
+    const start = Date.now();
+    const deadline = start + maxMs;
+    const maxConsecutiveFailures = 5;
+    let lastCount = -1;
+    let failures = 0;
+
+    while (Date.now() < deadline) {
+      await Bun.sleep(intervalMs);
+
+      let sample: string | null = null;
+      try {
+        const result = await this.cdp.send('Runtime.evaluate', {
+          expression: `(() => {
+            try { return document.readyState + ':' + document.getElementsByTagName('*').length; }
+            catch { return 'error:-1'; }
+          })()`,
+          returnByValue: true,
+        });
+        if (!result.exceptionDetails && result.result?.value !== undefined) {
+          sample = String(result.result.value);
+        }
+      } catch {
+        // Transient during a context swap — fall through to the retry counter.
+      }
+
+      const count = sample === null ? Number.NaN : Number.parseInt(sample.split(':')[1] ?? '', 10);
+      if (sample === null || Number.isNaN(count)) {
+        if (++failures >= maxConsecutiveFailures) return;
+        continue;
+      }
+      failures = 0;
+
+      // A stable element count is the settle signal, floored at minSettleMs for
+      // EVERY page — `readyState === 'complete'` is not a licence to return
+      // early. Plenty of pages build their DOM from a load handler or a short
+      // setTimeout, which run AFTER 'complete'; returning at ~300ms would
+      // snapshot them empty, a regression against the flat 800ms sleep this
+      // replaced. The floor keeps the old guarantee; the stability check is
+      // what lets a slow page take longer, up to maxMs.
+      const stable = count === lastCount;
+      if (stable && Date.now() - start >= minSettleMs) return;
+      lastCount = count;
+    }
   }
 
   /**
@@ -241,8 +359,13 @@ export class BrowserController {
 
   /**
    * Click an element by its snapshot ID.
+   * options.button: 'left' (default) or 'right' (context menu).
+   * options.double: double-click instead of single click.
    */
-  async click(elementId: number): Promise<string> {
+  async click(
+    elementId: number,
+    options: { button?: 'left' | 'right'; double?: boolean } = {},
+  ): Promise<string> {
     await this.ensureConnected();
 
     const coords = this.elementCoords.get(elementId);
@@ -250,36 +373,124 @@ export class BrowserController {
       return `Error: Element [${elementId}] not found. Run browser_snapshot first.`;
     }
 
+    const button = options.button === 'right' ? 'right' : 'left';
+
+    // Move the pointer onto the element first — hover-sensitive UIs
+    // (menus, message toolbars) expect mouseover before the press.
     await this.cdp.send('Input.dispatchMouseEvent', {
-      type: 'mousePressed',
+      type: 'mouseMoved',
       x: coords.x,
       y: coords.y,
-      button: 'left',
-      clickCount: 1,
     });
-    await this.cdp.send('Input.dispatchMouseEvent', {
-      type: 'mouseReleased',
-      x: coords.x,
-      y: coords.y,
-      button: 'left',
-      clickCount: 1,
-    });
+
+    const clicks = options.double ? 2 : 1;
+    for (let count = 1; count <= clicks; count++) {
+      await this.cdp.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: coords.x,
+        y: coords.y,
+        button,
+        clickCount: count,
+      });
+      await this.cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: coords.x,
+        y: coords.y,
+        button,
+        clickCount: count,
+      });
+    }
 
     // Wait for navigation/changes
     await Bun.sleep(1000);
 
-    return `Clicked element [${elementId}]`;
+    const kind = options.double ? 'Double-clicked' : button === 'right' ? 'Right-clicked' : 'Clicked';
+    return `${kind} element [${elementId}]`;
+  }
+
+  /**
+   * Hover the pointer over an element by its snapshot ID (trusted CDP mouse
+   * move). Reveals hover-only UI like message action toolbars. The revealed
+   * elements only show up in a NEW snapshot taken after this call.
+   */
+  async hover(elementId: number): Promise<string> {
+    await this.ensureConnected();
+
+    const coords = this.elementCoords.get(elementId);
+    if (!coords) {
+      return `Error: Element [${elementId}] not found. Run browser_snapshot first.`;
+    }
+
+    // Approach from a nearby point so mouseenter/mouseover always fire,
+    // even if the pointer already sat on the target coordinates.
+    await this.cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.max(0, coords.x - 10),
+      y: Math.max(0, coords.y - 10),
+    });
+    await this.cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: coords.x,
+      y: coords.y,
+    });
+
+    // Give the app time to render hover-triggered UI
+    await Bun.sleep(600);
+
+    return `Hovering over element [${elementId}]. Take a browser_snapshot to see any hover-revealed elements, then act before moving the mouse elsewhere.`;
+  }
+
+  /**
+   * Press a key or key combination (trusted CDP key events), e.g. "Enter",
+   * "Escape", "Tab", "ArrowDown", "Ctrl+K", "Shift+Enter". Keys go to the
+   * currently focused element.
+   */
+  async pressKey(combo: string): Promise<string> {
+    await this.ensureConnected();
+
+    const parsed = parseKeyCombo(combo);
+    if (!parsed) {
+      return `Error: Unsupported key "${combo}". Supported: ${SUPPORTED_KEYS_HINT}.`;
+    }
+
+    const base = {
+      key: parsed.key,
+      code: parsed.code,
+      windowsVirtualKeyCode: parsed.keyCode,
+      nativeVirtualKeyCode: parsed.keyCode,
+      modifiers: parsed.modifiers,
+    };
+
+    await this.cdp.send('Input.dispatchKeyEvent', {
+      type: parsed.text ? 'keyDown' : 'rawKeyDown',
+      ...base,
+      ...(parsed.text ? { text: parsed.text } : {}),
+    });
+    await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+
+    // Let the app react (menu open, mode switch, etc.)
+    await Bun.sleep(300);
+
+    return `Pressed ${parsed.display}`;
   }
 
   /**
    * Type text into an input element by its snapshot ID.
    * Optionally press Enter after typing.
    *
+   * By default the element's existing content is CLEARED first (replace
+   * semantics). Pass append=true to keep it and insert at the end instead.
+   *
    * Uses DOM focus + targeted value clearing instead of coordinate-click + Ctrl+A.
    * This prevents misclicks from wiping the wrong field (e.g., typing subject
    * text into the To field in Gmail's compact compose window).
    */
-  async type(elementId: number, text: string, submit: boolean = false): Promise<string> {
+  async type(
+    elementId: number,
+    text: string,
+    submit: boolean = false,
+    append: boolean = false,
+  ): Promise<string> {
     await this.ensureConnected();
 
     const coords = this.elementCoords.get(elementId);
@@ -293,19 +504,34 @@ export class BrowserController {
         const el = window.__jarvis_elements && window.__jarvis_elements[${elementId - 1}];
         if (!el) return 'not_found';
         el.focus();
-        // Clear existing content based on element type
+        const append = ${append};
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-          el.value = '';
-          el.dispatchEvent(new Event('input', { bubbles: true }));
+          if (append) {
+            // Move the caret to the end so the insert lands after existing text
+            try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
+          } else {
+            el.value = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
         } else if (el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
-          // For contenteditable divs, select all within this element only
-          const range = document.createRange();
+          // Use the element's OWN document/window — the element may live
+          // inside a same-origin iframe (Google Docs, Gmail compose), where
+          // the top document's selection can't reach it.
+          const doc = el.ownerDocument || document;
+          const win = doc.defaultView || window;
+          const range = doc.createRange();
           range.selectNodeContents(el);
-          const sel = window.getSelection();
+          const sel = win.getSelection();
           sel.removeAllRanges();
-          sel.addRange(range);
-          // Delete the selection
-          document.execCommand('delete', false, null);
+          if (append) {
+            // Collapse to the end of the element's content — insert appends
+            range.collapse(false);
+            sel.addRange(range);
+          } else {
+            // Select all within this element only, then delete the selection
+            sel.addRange(range);
+            doc.execCommand('delete', false, null);
+          }
         }
         return 'ok';
       })()`,
@@ -318,15 +544,17 @@ export class BrowserController {
       const clickResult = await this.click(elementId);
       if (clickResult.startsWith('Error:')) return clickResult;
       await Bun.sleep(200);
-      // Use Ctrl+A as fallback clearing (old behavior)
-      await this.cdp.send('Input.dispatchKeyEvent', {
-        type: 'keyDown', key: 'a', code: 'KeyA',
-        windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2,
-      });
-      await this.cdp.send('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: 'a', code: 'KeyA',
-        windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2,
-      });
+      if (!append) {
+        // Use Ctrl+A as fallback clearing (old behavior)
+        await this.cdp.send('Input.dispatchKeyEvent', {
+          type: 'keyDown', key: 'a', code: 'KeyA',
+          windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2,
+        });
+        await this.cdp.send('Input.dispatchKeyEvent', {
+          type: 'keyUp', key: 'a', code: 'KeyA',
+          windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2,
+        });
+      }
     } else {
       await Bun.sleep(200);
     }
@@ -334,7 +562,7 @@ export class BrowserController {
     // Insert text (like paste — much more reliable than char-by-char)
     await this.cdp.send('Input.insertText', { text });
 
-    let result = `Typed "${text}" into element [${elementId}]`;
+    let result = `${append ? 'Appended' : 'Typed'} "${text}" into element [${elementId}]`;
 
     if (submit) {
       await Bun.sleep(100);

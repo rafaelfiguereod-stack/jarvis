@@ -10,6 +10,8 @@
 
 import { GoogleAuth } from '../integrations/google-auth.ts';
 import { loadConfig } from '../config/loader.ts';
+import { externalUrl, resolveExternalOrigin } from '../util/external-origin.ts';
+import { GoogleOAuthFlowStore } from '../integrations/google-oauth-flow.ts';
 
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
@@ -21,11 +23,24 @@ async function main() {
   console.log('=== Google OAuth2 Setup for JARVIS ===');
   console.log('');
 
-  // Load config to get client_id / client_secret
+  // Load config to get client_id / client_secret. Dashboard-entered creds
+  // live in the vault DB (user-settings google fallback), so open it and
+  // merge before concluding nothing is configured.
   const config = await loadConfig();
+  try {
+    const { initDatabase } = await import('../vault/schema.ts');
+    const { mergeUserSettingsIntoConfig } = await import('../daemon/user-settings.ts');
+    initDatabase(config.daemon.db_path, { quiet: true });
+    mergeUserSettingsIntoConfig(config);
+  } catch {
+    // No DB yet (fresh install) - the interactive prompt below handles it.
+  }
 
   let clientId = config.google?.client_id ?? '';
   let clientSecret = config.google?.client_secret ?? '';
+  const externalOrigin = resolveExternalOrigin(config);
+  for (const warning of externalOrigin.warnings) console.warn(`Warning: ${warning}`);
+  const redirectUri = externalUrl(externalOrigin, '/api/auth/google/callback');
 
   if (!clientId || !clientSecret) {
     console.log('No Google OAuth credentials found in config.yaml.');
@@ -39,7 +54,7 @@ async function main() {
     console.log('To get credentials:');
     console.log('  1. Go to https://console.cloud.google.com/apis/credentials');
     console.log('  2. Create an OAuth2 client ID (Web application)');
-    console.log('  3. Add http://localhost:3142/api/auth/google/callback as a redirect URI');
+    console.log(`  3. Add ${redirectUri} as a redirect URI`);
     console.log('  4. Copy client_id and client_secret into config.yaml');
     console.log('');
 
@@ -69,7 +84,7 @@ async function main() {
     rl.close();
   }
 
-  const auth = new GoogleAuth(clientId, clientSecret);
+  const auth = new GoogleAuth(clientId, clientSecret, { redirectUri });
 
   // Check if already authenticated
   if (auth.isAuthenticated()) {
@@ -78,7 +93,12 @@ async function main() {
     process.exit(0);
   }
 
-  const authUrl = auth.getAuthUrl(SCOPES);
+  const oauthFlows = new GoogleOAuthFlowStore();
+  const startedFlow = oauthFlows.start(redirectUri);
+  const authUrl = auth.getAuthUrl(SCOPES, {
+    state: startedFlow.state,
+    codeChallenge: startedFlow.codeChallenge,
+  });
 
   console.log('');
   console.log('Opening browser for Google authorization...');
@@ -100,66 +120,80 @@ async function main() {
   }
 
   // Start temporary HTTP server to receive the callback
-  console.log('Waiting for authorization callback on port 3142...');
+  console.log(`Waiting for authorization callback at ${redirectUri}...`);
   console.log('');
 
-  const server = Bun.serve({
-    port: 3142,
-    async fetch(req) {
-      const url = new URL(req.url);
+  let server: ReturnType<typeof Bun.serve>;
+  try {
+    server = Bun.serve({
+      port: config.daemon.port,
+      async fetch(req) {
+        const url = new URL(req.url);
 
-      if (url.pathname === '/api/auth/google/callback') {
-        const code = url.searchParams.get('code');
-        const error = url.searchParams.get('error');
+        if (url.pathname === '/api/auth/google/callback') {
+          const code = url.searchParams.get('code');
+          const error = url.searchParams.get('error');
+          const state = url.searchParams.get('state');
 
-        if (error) {
-          console.error('Authorization denied:', error);
-          setTimeout(() => {
-            server.stop();
-            process.exit(1);
-          }, 500);
-          return new Response(
-            '<html><body><h1>Authorization Denied</h1><p>You can close this tab.</p></body></html>',
-            { headers: { 'Content-Type': 'text/html' } }
-          );
+          if (error) {
+            console.error('Authorization denied:', error);
+            setTimeout(() => {
+              server.stop();
+              process.exit(1);
+            }, 500);
+            return new Response(
+              '<html><body><h1>Authorization Denied</h1><p>You can close this tab.</p></body></html>',
+              { headers: { 'Content-Type': 'text/html' } }
+            );
+          }
+
+          if (!code) {
+            return new Response('Missing code', { status: 400 });
+          }
+
+          const pendingFlow = state ? oauthFlows.consume(state) : null;
+          if (!pendingFlow) {
+            return new Response('Invalid or expired OAuth state', { status: 400 });
+          }
+
+          try {
+            const tokens = await auth.exchangeCode(code, { codeVerifier: pendingFlow.codeVerifier });
+            console.log('Authorization successful!');
+            console.log(`Access token: ${tokens.access_token.slice(0, 20)}...`);
+            console.log(`Refresh token: ${tokens.refresh_token.slice(0, 20)}...`);
+            console.log(`Tokens saved to ~/.jarvis/google-tokens.json`);
+
+            setTimeout(() => {
+              server.stop();
+              process.exit(0);
+            }, 500);
+
+            return new Response(
+              '<html><body><h1>JARVIS Google Authorization Complete!</h1><p>Tokens saved. You can close this tab.</p></body></html>',
+              { headers: { 'Content-Type': 'text/html' } }
+            );
+          } catch (err) {
+            console.error('Token exchange failed:', err);
+            setTimeout(() => {
+              server.stop();
+              process.exit(1);
+            }, 500);
+            return new Response(
+              `<html><body><h1>Token Exchange Failed</h1><pre>${err}</pre></body></html>`,
+              { headers: { 'Content-Type': 'text/html' }, status: 500 }
+            );
+          }
         }
 
-        if (!code) {
-          return new Response('Missing code', { status: 400 });
-        }
-
-        try {
-          const tokens = await auth.exchangeCode(code);
-          console.log('Authorization successful!');
-          console.log(`Access token: ${tokens.access_token.slice(0, 20)}...`);
-          console.log(`Refresh token: ${tokens.refresh_token.slice(0, 20)}...`);
-          console.log(`Tokens saved to ~/.jarvis/google-tokens.json`);
-
-          setTimeout(() => {
-            server.stop();
-            process.exit(0);
-          }, 500);
-
-          return new Response(
-            '<html><body><h1>JARVIS Google Authorization Complete!</h1><p>Tokens saved. You can close this tab.</p></body></html>',
-            { headers: { 'Content-Type': 'text/html' } }
-          );
-        } catch (err) {
-          console.error('Token exchange failed:', err);
-          setTimeout(() => {
-            server.stop();
-            process.exit(1);
-          }, 500);
-          return new Response(
-            `<html><body><h1>Token Exchange Failed</h1><pre>${err}</pre></body></html>`,
-            { headers: { 'Content-Type': 'text/html' }, status: 500 }
-          );
-        }
-      }
-
-      return new Response('Not found', { status: 404 });
-    },
-  });
+        return new Response('Not found', { status: 404 });
+      },
+    });
+  } catch (err) {
+    console.error(`Could not listen on port ${config.daemon.port}: ${err instanceof Error ? err.message : err}`);
+    console.error('The Jarvis daemon is probably running and already owns that port.');
+    console.error('Connect Google from the dashboard instead: Settings → Integrations.');
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {

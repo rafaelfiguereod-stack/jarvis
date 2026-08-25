@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { uuid } from "../lib/uuid";
 
 export type MessageRole = "user" | "assistant" | "system";
 
@@ -26,6 +27,101 @@ export type ChatMessage = {
   isStreaming?: boolean;
   detail?: string; // raw error/debug payload, rendered collapsed in the chat
 };
+
+/**
+ * Merge vault history into whatever already landed in the chat list.
+ *
+ * `ws.onopen` awaits the history fetch, but `ws.onmessage` keeps firing during
+ * that await — a turn that completes inside the fetch window appends its
+ * message first. Replacing the list would drop that message; skipping the
+ * restore because the list is "not empty" would drop the entire conversation.
+ * So restored history goes first and only the live messages it does not
+ * already account for are kept after it.
+ *
+ * Vault rows carry their own ids, so the live copy of a persisted message
+ * never matches by id — role + text is the only usable identity here. Matches
+ * are consumed one-for-one so a genuinely repeated answer keeps both copies.
+ */
+export function mergeRestoredHistory(
+  restored: ChatMessage[],
+  live: ChatMessage[],
+): ChatMessage[] {
+  if (live.length === 0) return restored;
+
+  const key = (message: ChatMessage) => `${message.role}\u0000${message.content.trim()}`;
+  const available = new Map<string, number>();
+  for (const message of restored) {
+    const messageKey = key(message);
+    available.set(messageKey, (available.get(messageKey) ?? 0) + 1);
+  }
+
+  const unmatched = live.filter((message) => {
+    const messageKey = key(message);
+    const remaining = available.get(messageKey) ?? 0;
+    if (remaining === 0) return true;
+    available.set(messageKey, remaining - 1);
+    return false;
+  });
+
+  return [...restored, ...unmatched];
+}
+
+export function finalizeStreamMessage(
+  messages: ChatMessage[],
+  options: {
+    id: string;
+    fullText?: string;
+    timestamp: number;
+    toolCalls: ToolCall[];
+    subAgentEvents: SubAgentEvent[];
+  },
+): ChatMessage[] {
+  const index = messages.findIndex((message) => message.id === options.id);
+  if (index < 0) {
+    if (!options.fullText) return messages;
+    return [...messages, {
+      id: options.id,
+      role: "assistant",
+      content: options.fullText,
+      timestamp: options.timestamp,
+      isStreaming: false,
+      ...(options.toolCalls.length ? { toolCalls: options.toolCalls } : {}),
+      ...(options.subAgentEvents.length ? { subAgentEvents: options.subAgentEvents } : {}),
+    }];
+  }
+
+  return messages.map((message, messageIndex) => messageIndex === index
+    ? {
+        ...message,
+        content: options.fullText || message.content,
+        isStreaming: false,
+        toolCalls: options.toolCalls.length ? options.toolCalls : message.toolCalls,
+        subAgentEvents: options.subAgentEvents.length ? options.subAgentEvents : message.subAgentEvents,
+      }
+    : message);
+}
+
+/**
+ * Next value of the local stream buffer for an incoming text chunk.
+ *
+ * Chunks are broadcast to every dashboard, so a client that opens, reloads, or
+ * reconnects mid-turn starts with an empty buffer and would render the answer
+ * with its opening cut off. The relay stamps every chunk with `accumulated` —
+ * its own running total for the request, already including this chunk — so the
+ * first chunk a late client sees carries everything it missed. Prefer it and
+ * the answer is whole from the first render instead of staying truncated until
+ * the terminal frame repairs it.
+ *
+ * Falls back to local accumulation when `accumulated` is absent, so a daemon
+ * that predates the field still streams correctly.
+ */
+export function nextStreamBuffer(
+  buffer: string,
+  payload: { text?: string; accumulated?: unknown },
+): string {
+  if (typeof payload.accumulated === "string") return payload.accumulated;
+  return buffer + (payload.text ?? "");
+}
 
 export type TaskEvent = {
   action: "created" | "updated" | "deleted";
@@ -83,22 +179,38 @@ export type AgentActivityEvent = {
   timestamp: number;
 };
 
+/**
+ * Daemon broadcast after DB-backed settings were hot-applied (per-section
+ * save, POST /api/config/reload, or SIGHUP). Carries section names and
+ * error strings only — never setting values.
+ */
+export type SettingsAppliedEvent = {
+  sections: string[];
+  ok: boolean;
+  errors?: { section: string; error: string }[];
+  timestamp: number;
+};
+
 export type VoiceCallbacks = {
   onTTSBinary: (data: ArrayBuffer) => void;
   /** `containsWake` — true if the TTS sentence about to play contains
    *  "Jarvis". UI uses it to suppress the wake-word recognizer for the
-   *  duration of the playback so TTS doesn't self-trigger via mic echo. */
-  onTTSStart: (requestId: string, containsWake: boolean) => void;
-  /** Mid-turn flip: a later sentence in the same turn contains "Jarvis". */
-  onTTSContainsWake?: () => void;
+   *  duration of the playback so TTS doesn't self-trigger via mic echo.
+   *  `containsStop` — the sentence contains a spoken stop phrase
+   *  ("Jarvis, stop"), so the UI must also suppress its stop-phrase
+   *  bypass or the echo cancels the playback. */
+  onTTSStart: (requestId: string, containsWake: boolean, containsStop?: boolean) => void;
+  /** Mid-turn flip: a later sentence in the same turn contains "Jarvis"
+   *  (and possibly a stop phrase). */
+  onTTSContainsWake?: (containsStop?: boolean) => void;
   /** `bargeIn` — realtime voice sends tts_end{bargeIn:true} when the user
    *  starts speaking, so the player can flush queued output immediately. */
-  onTTSEnd: (bargeIn?: boolean) => void;
+  onTTSEnd: (requestId?: string, bargeIn?: boolean) => void;
   onError: (message?: string) => void;
   /** Realtime session ended server-side (max_session_minutes timeout or
    *  server close). The client must stop the mic — it's otherwise streaming
    *  into a session that no longer exists. */
-  onRealtimeClosed?: () => void;
+  onRealtimeClosed?: (reason?: string) => void;
 };
 
 export type WorkflowEvent = {
@@ -179,7 +291,7 @@ type SidecarEventPayload = {
 function createSidecarNotice(payload: SidecarEventPayload, timestamp?: number): ChatMessage & { notice?: SystemNotice } {
   const reason = payload.event?.reason?.trim();
   const notice: SystemNotice = {
-    id: crypto.randomUUID(),
+    id: uuid(),
     title: "Sidecar offline",
     text: reason
       ? `Jarvis sidecar disconnected: ${reason}. Dashboard features may be delayed until it reconnects.`
@@ -188,7 +300,7 @@ function createSidecarNotice(payload: SidecarEventPayload, timestamp?: number): 
   };
 
   return {
-    id: crypto.randomUUID(),
+    id: uuid(),
     role: "system",
     content: notice.text,
     timestamp: timestamp ?? Date.now(),
@@ -248,6 +360,7 @@ function deriveImpactFromCategory(category: string): ApprovalImpact {
  */
 export type ProviderErrorCode =
   | "auth"
+  | "forbidden"
   | "rate_limit"
   | "network"
   | "bad_request"
@@ -255,10 +368,16 @@ export type ProviderErrorCode =
   | "server"
   | "unknown";
 
+/** Shared by the structured `forbidden` code and the keyword fallbacks below. */
+const FORBIDDEN_SUMMARY =
+  "Your AI provider accepted the API key but won't allow this model. Check that your plan or organization has access to it, or pick a different model.";
+
 function summaryForCode(code: ProviderErrorCode | undefined): string | null {
   switch (code) {
     case "auth":
       return "Couldn't reach your AI provider. Check your API key and model settings.";
+    case "forbidden":
+      return FORBIDDEN_SUMMARY;
     case "rate_limit":
       return "Your AI provider is rate-limiting requests. Wait a moment, or check your usage and billing.";
     case "network":
@@ -308,6 +427,20 @@ export function formatProviderErrorMessage(
 
   const lowered = normalized.toLowerCase();
 
+  // Mirrors classifyErrorString: authoritative 403 markers first, the softer
+  // permission wording after the auth bucket.
+  if (
+    lowered.includes("forbidden") ||
+    lowered.includes("permission_error") ||
+    lowered.includes("permission_denied") ||
+    /\b403\b/.test(lowered)
+  ) {
+    return {
+      summary: FORBIDDEN_SUMMARY,
+      detail: normalized,
+    };
+  }
+
   if (
     lowered.includes("api key") ||
     lowered.includes("authentication") ||
@@ -319,6 +452,13 @@ export function formatProviderErrorMessage(
   ) {
     return {
       summary: "Couldn't reach your AI provider. Check your API key and model settings.",
+      detail: normalized,
+    };
+  }
+
+  if (lowered.includes("permission denied") || lowered.includes("not have access")) {
+    return {
+      summary: FORBIDDEN_SUMMARY,
       detail: normalized,
     };
   }
@@ -362,11 +502,13 @@ export function useWebSocket() {
   const [workflowEvents, setWorkflowEvents] = useState<WorkflowEvent[]>([]);
   const [goalEvents, setGoalEvents] = useState<GoalEvent[]>([]);
   const [siteEvents, setSiteEvents] = useState<SiteEvent[]>([]);
+  const [settingsEvents, setSettingsEvents] = useState<SettingsAppliedEvent[]>([]);
   const [notices, setNotices] = useState<SystemNotice[]>([]);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [clarifiers, setClarifiers] = useState<PendingClarifier[]>([]);
   const [repeatBacks, setRepeatBacks] = useState<PendingRepeatBack[]>([]);
   const [thinking, setThinking] = useState(false);
+  const [isResponding, setIsResponding] = useState(false);
   const [roomNavRequest, setRoomNavRequest] = useState<{ key: string; ts: number } | null>(null);
   const [windowControlRequest, setWindowControlRequest] = useState<{
     action: "close" | "minimize" | "expand" | "restore" | "reorder";
@@ -380,14 +522,25 @@ export function useWebSocket() {
     ts: number;
   } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // History is authoritative only for the first successful load. After that the
+  // client holds messages the vault never persists (system notices, errors,
+  // workflow lines), so a reconnect must not re-seed from the vault.
+  const historyHydratedRef = useRef(false);
   const streamBufferRef = useRef<string>("");
   const streamIdRef = useRef<string | null>(null);
   const toolCallsRef = useRef<ToolCall[]>([]);
   const subAgentEventsRef = useRef<SubAgentEvent[]>([]);
   const voiceCallbacksRef = useRef<VoiceCallbacks | null>(null);
   const pendingChatIdsRef = useRef<Set<string>>(new Set());
+  /** Request whose chunks currently own the single foreground composer turn. */
+  const currentChatRequestIdRef = useRef<string | null>(null);
 
   const connect = useCallback(() => {
+    // A manual "Retry now" or the scheduled backoff can fire while a socket is
+    // already opening/open; clear any pending backoff and don't stack sockets.
+    if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) return;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
     ws.binaryType = "arraybuffer";
@@ -395,24 +548,27 @@ export function useWebSocket() {
     ws.onopen = async () => {
       setIsConnected(true);
       console.log("[WS] Connected");
-      // Load chat history from backend on connect
-      try {
-        const resp = await fetch("/api/vault/conversations/active?channel=websocket");
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data.messages && data.messages.length > 0) {
-            const restored: ChatMessage[] = data.messages.map((m: any) => ({
-              id: m.id,
-              role: m.role as MessageRole,
-              content: m.content,
-              timestamp: m.created_at,
-              toolCalls: m.tool_calls ?? undefined,
-            }));
-            setMessages((prev) => prev.length === 0 ? restored : prev);
+      // Load chat history from backend on the first connect that gets an answer.
+      if (!historyHydratedRef.current) {
+        try {
+          const resp = await fetch("/api/vault/conversations/active?channel=websocket");
+          if (resp.ok) {
+            const data = await resp.json();
+            historyHydratedRef.current = true;
+            if (data.messages && data.messages.length > 0) {
+              const restored: ChatMessage[] = data.messages.map((m: any) => ({
+                id: m.id,
+                role: m.role as MessageRole,
+                content: m.content,
+                timestamp: m.created_at,
+                toolCalls: m.tool_calls ?? undefined,
+              }));
+              setMessages((prev) => mergeRestoredHistory(restored, prev));
+            }
           }
+        } catch (err) {
+          console.warn("[WS] Failed to load history:", err);
         }
-      } catch (err) {
-        console.warn("[WS] Failed to load history:", err);
       }
 
       // Rehydrate any pending approval requests so a daemon restart (or a
@@ -455,8 +611,10 @@ export function useWebSocket() {
 
     ws.onclose = () => {
       setIsConnected(false);
+      setIsResponding(false);
+      currentChatRequestIdRef.current = null;
       console.log("[WS] Disconnected, reconnecting in 2s...");
-      setTimeout(connect, 2000);
+      reconnectTimerRef.current = setTimeout(connect, 2000);
     };
 
     ws.onerror = () => {
@@ -478,6 +636,7 @@ export function useWebSocket() {
           voiceCallbacksRef.current?.onTTSStart(
             msg.payload?.requestId,
             Boolean(msg.payload?.containsWake),
+            Boolean(msg.payload?.containsStop),
           );
           setThinking(false); // speaking supersedes thinking
           return;
@@ -487,12 +646,17 @@ export function useWebSocket() {
           // UI must suppress the wake recognizer so TTS playback doesn't
           // self-trigger.
           if (msg.payload?.containsWake) {
-            voiceCallbacksRef.current?.onTTSContainsWake?.();
+            voiceCallbacksRef.current?.onTTSContainsWake?.(
+              Boolean(msg.payload?.containsStop),
+            );
           }
           return;
         }
         if (msg.type === "tts_end") {
-          voiceCallbacksRef.current?.onTTSEnd(Boolean(msg.payload?.bargeIn));
+          voiceCallbacksRef.current?.onTTSEnd(
+            msg.payload?.requestId,
+            Boolean(msg.payload?.bargeIn),
+          );
           return;
         }
         // Premium realtime voice (gpt-realtime-2) status + live captions.
@@ -505,7 +669,7 @@ export function useWebSocket() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 role: "system" as MessageRole,
                 content: msg.payload.message,
                 timestamp: msg.timestamp,
@@ -514,7 +678,7 @@ export function useWebSocket() {
           }
           if (state === "error") voiceCallbacksRef.current?.onError(msg.payload?.message);
           // Server tore the session down (timeout/close) — stop the hot mic.
-          else if (state === "closed") voiceCallbacksRef.current?.onRealtimeClosed?.();
+          else if (state === "closed") voiceCallbacksRef.current?.onRealtimeClosed?.(msg.payload?.reason);
           return;
         }
         if (msg.type === "realtime_transcript") {
@@ -523,7 +687,7 @@ export function useWebSocket() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: uuid(),
                 role: (msg.payload.role === "assistant" ? "assistant" : "user") as MessageRole,
                 content: msg.payload.text,
                 timestamp: msg.timestamp,
@@ -533,10 +697,30 @@ export function useWebSocket() {
           return;
         }
         if (msg.type === "thinking_start") {
+          // thinking_start is a broadcast (voice pipeline), so it can arrive
+          // for a turn other than the one this client owns. Never overwrite
+          // an active turn's id — a stale broadcast would make the gate drop
+          // the active response's stream chunks and strand the composer in
+          // its Stop state.
+          if (
+            currentChatRequestIdRef.current
+            && msg.id
+            && msg.id !== currentChatRequestIdRef.current
+          ) return;
           setThinking(true);
+          setIsResponding(true);
+          if (msg.id && !currentChatRequestIdRef.current) {
+            currentChatRequestIdRef.current = msg.id;
+          }
           return;
         }
         if (msg.type === "thinking_end") {
+          const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+          if (
+            currentChatRequestIdRef.current
+            && requestId
+            && requestId !== currentChatRequestIdRef.current
+          ) return;
           setThinking(false);
           return;
         }
@@ -546,7 +730,7 @@ export function useWebSocket() {
           setMessages((prev) => [
             ...prev,
             {
-              id: msg.id ?? crypto.randomUUID(),
+              id: msg.id ?? uuid(),
               role: "user" as MessageRole,
               content: msg.payload.text,
               timestamp: msg.timestamp,
@@ -571,7 +755,7 @@ export function useWebSocket() {
       setMessages((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: uuid(),
           role: "system" as MessageRole,
           content: msg.payload.text,
           timestamp: msg.timestamp,
@@ -580,6 +764,14 @@ export function useWebSocket() {
         },
       ]);
     } else if (msg.type === "stream") {
+      const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+      const currentRequestId = currentChatRequestIdRef.current;
+      // A cancelled/superseded provider can deliver one final network chunk
+      // while its async iterator unwinds. Never append it to the replacement
+      // response (the old single-buffer behavior caused overlapping answers).
+      if (currentRequestId && requestId && requestId !== currentRequestId) return;
+      if (!currentRequestId && requestId) currentChatRequestIdRef.current = requestId;
+      setIsResponding(true);
       if (msg.payload?.source === "sub-agent") {
         // Sub-agent progress event
         const event: SubAgentEvent = {
@@ -592,7 +784,7 @@ export function useWebSocket() {
 
         // Add to agent activity feed
         const activityEvent: AgentActivityEvent = {
-          id: crypto.randomUUID(),
+          id: uuid(),
           agentName: msg.payload.agentName,
           agentId: msg.payload.agentId,
           eventType: msg.payload.type,
@@ -631,11 +823,11 @@ export function useWebSocket() {
         }
       } else if (msg.payload?.text) {
         // Text chunk
-        streamBufferRef.current += msg.payload.text;
+        streamBufferRef.current = nextStreamBuffer(streamBufferRef.current, msg.payload);
 
         if (!streamIdRef.current) {
           // Start a new assistant message
-          const id = crypto.randomUUID();
+          const id = requestId ? `assistant:${requestId}` : uuid();
           streamIdRef.current = id;
           setMessages((prev) => [
             ...prev,
@@ -658,28 +850,28 @@ export function useWebSocket() {
           );
         }
       }
-    } else if (msg.type === "status" && msg.payload?.status === "done") {
-      // Stream complete
-      if (streamIdRef.current) {
-        const finalId = streamIdRef.current;
-        const finalToolCalls = toolCallsRef.current;
-        const finalSubAgentEvents = subAgentEventsRef.current;
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === finalId
-              ? {
-                  ...m,
-                  isStreaming: false,
-                  toolCalls:
-                    finalToolCalls.length > 0 ? finalToolCalls : m.toolCalls,
-                  subAgentEvents:
-                    finalSubAgentEvents.length > 0
-                      ? finalSubAgentEvents
-                      : m.subAgentEvents,
-                }
-              : m
-          )
-        );
+    } else if (
+      msg.type === "status"
+      && (msg.payload?.status === "done" || msg.payload?.status === "cancelled")
+    ) {
+      const requestId = String(msg.payload?.requestId ?? msg.id ?? "");
+      if (
+        currentChatRequestIdRef.current
+        && requestId
+        && requestId !== currentChatRequestIdRef.current
+      ) return;
+      // Stream complete or explicitly stopped. Keep partial text visible but
+      // remove its speaking/streaming state immediately.
+      const finalId = streamIdRef.current || (requestId ? `assistant:${requestId}` : "");
+      if (finalId) {
+        const fullText = typeof msg.payload?.fullText === "string" ? msg.payload.fullText : undefined;
+        setMessages((prev) => finalizeStreamMessage(prev, {
+          id: finalId,
+          fullText,
+          timestamp: msg.timestamp || Date.now(),
+          toolCalls: toolCallsRef.current,
+          subAgentEvents: subAgentEventsRef.current,
+        }));
       }
       // Reset stream state
       streamBufferRef.current = "";
@@ -688,6 +880,9 @@ export function useWebSocket() {
       subAgentEventsRef.current = [];
       // A successful completion ends any in-flight chat request correlation.
       pendingChatIdsRef.current.clear();
+      currentChatRequestIdRef.current = null;
+      setIsResponding(false);
+      setThinking(false);
     } else if (msg.type === "goal_event") {
       const goalEvent = msg.payload as GoalEvent;
       setGoalEvents((prev) => [...prev.slice(-100), goalEvent]);
@@ -700,7 +895,7 @@ export function useWebSocket() {
         setMessages((prev) => [
           ...prev,
           {
-            id: crypto.randomUUID(),
+            id: uuid(),
             role: "system" as MessageRole,
             content: String(wfEvent.data.message),
             timestamp: wfEvent.timestamp,
@@ -711,6 +906,10 @@ export function useWebSocket() {
     } else if (msg.type === "site_event") {
       const siteEvent = msg.payload as SiteEvent;
       setSiteEvents((prev) => [...prev.slice(-100), siteEvent]);
+    } else if (msg.type === "settings_applied") {
+      const payload = msg.payload as Omit<SettingsAppliedEvent, "timestamp">;
+      const event: SettingsAppliedEvent = { ...payload, timestamp: msg.timestamp };
+      setSettingsEvents((prev) => [...prev.slice(-20), event]);
     } else if (msg.type === "notification") {
       const payload = msg.payload as {
         source?: string;
@@ -752,7 +951,7 @@ export function useWebSocket() {
         setMessages((prev) => [
           ...prev,
           {
-            id: msg.id ?? crypto.randomUUID(),
+            id: msg.id ?? uuid(),
             role: "assistant",
             content: String(payload.text),
             timestamp: msg.timestamp,
@@ -921,7 +1120,7 @@ export function useWebSocket() {
       setMessages((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: uuid(),
           role: "system",
           content,
           detail,
@@ -934,21 +1133,67 @@ export function useWebSocket() {
       streamIdRef.current = null;
       toolCallsRef.current = [];
       subAgentEventsRef.current = [];
+      currentChatRequestIdRef.current = null;
+      setIsResponding(false);
+      setThinking(false);
     }
   }, []);
 
   useEffect(() => {
     connect();
+    // "Retry now" on the offline system-state forces an immediate reconnect
+    // instead of waiting out the 2s backoff (recovery is automatic either way).
+    const onManualRetry = () => connect();
+    window.addEventListener("jarvis:ws-reconnect", onManualRetry);
     return () => {
+      window.removeEventListener("jarvis:ws-reconnect", onManualRetry);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       wsRef.current?.close();
     };
   }, [connect]);
+
+  const cancelResponse = useCallback(() => {
+    const requestId = currentChatRequestIdRef.current;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "cancel",
+        payload: requestId ? { requestId } : {},
+        id: requestId ?? undefined,
+        timestamp: Date.now(),
+      }));
+    }
+
+    if (streamIdRef.current) {
+      const finalId = streamIdRef.current;
+      setMessages((prev) => prev.map((message) =>
+        message.id === finalId ? { ...message, isStreaming: false } : message
+      ));
+    }
+    streamBufferRef.current = "";
+    streamIdRef.current = null;
+    toolCallsRef.current = [];
+    subAgentEventsRef.current = [];
+    pendingChatIdsRef.current.clear();
+    currentChatRequestIdRef.current = null;
+    setThinking(false);
+    setIsResponding(false);
+  }, []);
 
   const sendMessage = useCallback(
     (text: string, options?: { projectId?: string; currentRoom?: string }) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
-      const id = crypto.randomUUID();
+      // Typed barge-in: the replacement turn owns the composer immediately.
+      // The daemon also enforces this, but doing it here prevents even a single
+      // late chunk from the old request flashing into the new response. The ref
+      // is set before isResponding in every path, so it alone is a sufficient
+      // (and render-stable) guard.
+      if (currentChatRequestIdRef.current) cancelResponse();
+
+      const id = uuid();
+      currentChatRequestIdRef.current = id;
+      setIsResponding(true);
 
       // Add user message to local state
       setMessages((prev) => [
@@ -979,9 +1224,23 @@ export function useWebSocket() {
         id,
         timestamp: Date.now(),
       };
-      wsRef.current.send(JSON.stringify(msg));
+      try {
+        wsRef.current.send(JSON.stringify(msg));
+      } catch (err) {
+        // Never fail a submit silently (issue #260): surface a notice so the
+        // composer doesn't look alive while nothing reaches the daemon.
+        console.error("Failed to send chat message:", err);
+        pendingChatIdsRef.current.delete(id);
+        const notice: SystemNotice = {
+          id: uuid(),
+          title: "Message not sent",
+          text: `Could not send your message: ${err instanceof Error ? err.message : String(err)}`,
+          level: "warning",
+        };
+        setNotices((prev) => [notice, ...prev.filter((item) => item.text !== notice.text)].slice(0, 3));
+      }
     },
-    []
+    [cancelResponse]
   );
 
   const dismissNotice = useCallback((noticeId: string) => {
@@ -989,7 +1248,7 @@ export function useWebSocket() {
   }, []);
 
   return {
-    messages, isConnected, sendMessage, taskEvents, contentEvents, agentActivity, workflowEvents, goalEvents, siteEvents, notices, dismissNotice,
+    messages, isConnected, sendMessage, cancelResponse, isResponding, taskEvents, contentEvents, agentActivity, workflowEvents, goalEvents, siteEvents, settingsEvents, notices, dismissNotice,
     approvals,
     clarifiers,
     repeatBacks,

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import type { SettingsHook } from "../useSettingsData";
+import { confirmDialog } from "../../../ui/ConfirmDialog";
 import { resetOnboarding } from "../../../onboarding/resetClient";
 
 export function ProfileTab({
@@ -15,10 +16,17 @@ export function ProfileTab({
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
+  // Seed the local draft from the server profile, but NOT while the user is
+  // mid-edit. `profile` gets a fresh object reference on every 10s settings
+  // poll, so without the `editing` guard this effect would re-fire on each
+  // poll and overwrite in-progress typing with the last-saved values. While
+  // editing, the draft is owned by the user; we re-sync on the next idle
+  // render (after Save, Cancel, or Clear all flip `editing` back to false).
   useEffect(() => {
     if (!profile) return;
+    if (editing) return;
     setAnswers(profile.profile?.answers ?? {});
-  }, [profile]);
+  }, [profile, editing]);
 
   const steps = useMemo(() => {
     if (!profile) return [];
@@ -54,7 +62,7 @@ export function ProfileTab({
   };
 
   const handleClear = async () => {
-    if (!confirm("Clear the saved user profile context?")) return;
+    if (!await confirmDialog("Clear the saved user profile context?")) return;
     const r = await data.clearProfile();
     if (r.ok) {
       setAnswers({});
@@ -255,7 +263,7 @@ function OnboardingReplaySection({
       scope === "profile"
         ? "Re-run the profile interview? Your saved profile facts will be cleared first. The page will reload."
         : "Replay the dashboard tutorial? The page will reload.";
-    if (!confirm(label)) return;
+    if (!await confirmDialog(label)) return;
     setBusy(scope === "profile" ? "interview" : "tutorial");
     try {
       await resetOnboarding(scope);

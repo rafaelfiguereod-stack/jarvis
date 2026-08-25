@@ -11,11 +11,13 @@ Each enrollment token contains two operator-controlled URLs:
 - `brain` → the WebSocket endpoint the sidecar dials (`wss://.../sidecar/connect` or `ws://.../sidecar/connect`)
 - `jwks` → the HTTP(S) endpoint the sidecar uses to fetch the signing key (`https://.../api/sidecars/.well-known/jwks.json`)
 
-In the current daemon, those claims are chosen from a single configured brain origin with this precedence:
+In the current daemon, those claims are chosen from a single configured public origin with this precedence:
 
-1. `JARVIS_BRAIN_DOMAIN`
-2. `daemon.brain_domain`
-3. `localhost:<daemon.port>` fallback
+1. `JARVIS_PUBLIC_URL`
+2. `daemon.public_url`
+3. `JARVIS_BRAIN_DOMAIN` (legacy alias)
+4. `daemon.brain_domain` (legacy alias)
+5. `localhost:<daemon.port>` fallback
 
 At startup, the daemon applies the env override in `src/config/loader.ts`, then passes the effective value into `SidecarManager` in `src/daemon/index.ts`. `src/sidecar/manager.ts` derives both JWT claims from that one origin:
 
@@ -25,7 +27,8 @@ At startup, the daemon applies the env override in `src/config/loader.ts`, then 
 
 ### What to Set for Remote Sidecars
 
-For sidecars running on another machine, set `JARVIS_BRAIN_DOMAIN` or `daemon.brain_domain` to the public origin that machine can actually reach.
+For sidecars running on another machine, set `JARVIS_PUBLIC_URL` or
+`daemon.public_url` to the public origin that machine can actually reach.
 
 Good examples:
 
@@ -82,11 +85,25 @@ Asymmetric signing (ES256) allows sidecars to **verify** that a token was genuin
 
 ## Enrollment Flow
 
-### Step 1: User Initiates Enrollment (Dashboard)
+### Step 1: User Initiates Enrollment (CLI)
 
-On the Jarvis dashboard, the user clicks **"Add Sidecar"** and provides:
+On the machine running the brain, the user runs:
 
-- **Sidecar name** — a human-readable identifier (e.g., `home-desktop`, `work-laptop`)
+```
+jarvis enroll "<device-name>"
+```
+
+- **`<device-name>`** — a human-readable identifier (e.g., `home-desktop`, `work-laptop`). Enrolling an existing name re-mints its token (upsert); add `--rotate` to also invalidate all previously issued tokens for that device.
+
+The CLI opens the database directly, so it works without a running daemon — including over SSH. Related commands:
+
+```
+jarvis enroll "<name>" [--json] [--rotate]   # mint (or re-mint) a device token
+jarvis sidecars list [--json]                # list enrolled devices
+jarvis revoke <sid>                          # revoke a device
+```
+
+(An authenticated `POST /api/sidecars/enroll` endpoint also exists for programmatic use, but the CLI is the normal path.)
 
 ### Step 2: Brain Generates JWT
 
@@ -114,7 +131,7 @@ The brain creates a signed JWT containing:
 | `jwks` | URL to fetch the brain's public key for token verification |
 | `iat`  | Issued-at timestamp                                      |
 
-**Note:** There is no `exp` (expiration) claim. Tokens are long-lived and revoked explicitly via the dashboard.
+**Note:** There is no `exp` (expiration) claim. Tokens are long-lived and revoked explicitly (`jarvis revoke <sid>`).
 
 The `brain` and `jwks` claims are operational, not informational:
 
@@ -125,7 +142,7 @@ If those claims point at the wrong domain, an old ingress, or a host unreachable
 
 ### Step 3: User Copies Token to Sidecar
 
-The dashboard displays the JWT as a copyable string. The user pastes it into the sidecar process configuration (e.g., `~/.jarvis-sidecar/config.yaml`).
+`jarvis enroll` prints the JWT to the terminal. The user pastes it into the sidecar's token form (the desktop app asks for it on first run; it is also accepted in Settings, and headlessly via `--token`). Before the token is stored, the sidecar verifies it against the brain it names by requesting an access token (`POST {brain}/sidecar/token` with the enrollment JWT as bearer): an unreachable brain URL, a rejected token, and a server that isn't a Jarvis brain each produce a distinct inline error, and nothing is saved. Only a token the brain accepted is written to the sidecar configuration at `~/.jarvis/sidecar.yaml`.
 
 ### Step 4: Sidecar Verifies Token
 
@@ -170,10 +187,10 @@ The brain:
 
 ## Token Revocation
 
-Tokens can be revoked from the dashboard by deleting the sidecar. The brain maintains a registry of enrolled sidecars in the database. When a sidecar is deleted:
+Tokens are revoked by deleting the sidecar with `jarvis revoke <sid>` (find the `sid` with `jarvis sidecars list`). The brain maintains a registry of enrolled sidecars in the database. When a sidecar is deleted:
 
 - Its record is removed from the registry
-- Any active WebSocket connection is terminated
+- Any active WebSocket connection is terminated (a running daemon sweeps and severs live sessions of revoked devices within ~30 seconds; new connections and token mints are rejected immediately)
 - The JWT token becomes invalid (the `sid` is no longer recognized), even though the signature still verifies
 
 ## JWKS Endpoint
@@ -206,11 +223,11 @@ This endpoint requires no authentication — public keys are safe to expose.
 Symptoms:
 
 - the JWT payload shows `brain` or `jwks` pointing at `localhost`, an outdated hostname, or an internal-only address
-- enrollment looked fine in the dashboard, but the sidecar is on another machine
+- enrollment looked fine on the brain machine, but the sidecar is on another machine (`jarvis enroll` warns when the token falls back to `localhost:<port>`)
 
 Fix:
 
-1. Set `JARVIS_BRAIN_DOMAIN` or `daemon.brain_domain` to the correct public origin
+1. Set `JARVIS_PUBLIC_URL` or `daemon.public_url` to the correct public origin
 2. Restart/reload Jarvis so the daemon uses the new value
 3. Re-enroll the sidecar so a fresh token is minted with corrected claims
 
@@ -246,11 +263,13 @@ Fix:
 
 ### YAML and environment disagree
 
-`JARVIS_BRAIN_DOMAIN` overrides `daemon.brain_domain`. If the token does not match the YAML value you expected, check the daemon process environment first.
+`JARVIS_PUBLIC_URL` overrides `daemon.public_url`, which overrides the legacy
+brain-domain settings. If the token does not match the YAML value you expected,
+check the daemon process environment first.
 
 ## Security Considerations
 
-1. **Token transport:** The JWT is displayed once on the dashboard and must be securely transferred to the sidecar machine by the user. Treat it like a password.
+1. **Token transport:** The JWT is printed to the terminal by `jarvis enroll` and must be securely transferred to the sidecar machine by the user. Treat it like a password.
 2. **TLS required:** Both the JWKS fetch and the WebSocket connection must use HTTPS/WSS in production.
 3. **No expiration:** Tokens don't expire. Revocation is handled by removing the sidecar from the brain's registry.
 4. **Single key pair:** One ES256 key pair signs all sidecar tokens. Rotation requires re-enrollment of all sidecars.

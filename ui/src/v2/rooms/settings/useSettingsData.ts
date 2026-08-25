@@ -16,7 +16,13 @@ export type LLMProviderKind =
   | "openrouter"
   | "nvidia"
   | "openai_compatible"
-  | "litellm";
+  | "litellm"
+  | "omniroute"
+  // Hosted platform proxy. SYSTEM-owned: injected by the daemon on hosted
+  // installs, never user-creatable, so it is deliberately absent from
+  // LLM_PROVIDER_KINDS (the "Add provider" dropdown) and from every one of
+  // the key/url field sets below (no credential inputs are ever shown).
+  | "usejarvis_ai";
 
 export const LLM_PROVIDER_KINDS: readonly LLMProviderKind[] = [
   "anthropic",
@@ -28,6 +34,7 @@ export const LLM_PROVIDER_KINDS: readonly LLMProviderKind[] = [
   "nvidia",
   "openai_compatible",
   "litellm",
+  "omniroute",
 ] as const;
 
 export const LLM_PROVIDER_KIND_LABELS: Record<LLMProviderKind, string> = {
@@ -40,6 +47,8 @@ export const LLM_PROVIDER_KIND_LABELS: Record<LLMProviderKind, string> = {
   nvidia: "NVIDIA NIM",
   openai_compatible: "OpenAI-compatible",
   litellm: "LiteLLM",
+  omniroute: "OmniRoute",
+  usejarvis_ai: "Usejarvis AI",
 };
 
 /**
@@ -53,13 +62,49 @@ export const KEY_BASED_KINDS: ReadonlySet<LLMProviderKind> = new Set([
   "gemini",
   "openrouter",
   "nvidia",
+  "openai_compatible",
+  "litellm",
+  "omniroute",
 ]);
+
+/**
+ * Kinds that show a key field but don't require it - local gateway installs
+ * can run without auth (the daemon instantiates them keyless too).
+ */
+export const OPTIONAL_KEY_KINDS: ReadonlySet<LLMProviderKind> = new Set([
+  "omniroute",
+  "openai_compatible",
+  "litellm",
+]);
+
+/**
+ * Whether the settings form may send an `auth_header` override for a provider.
+ *
+ * Only true when the provider authenticates with a key AND points at a custom
+ * endpoint - i.e. exactly when the header dropdown is on screen and the user
+ * actually made a choice. Sending an override in any other case overrides the
+ * provider's own default: `Authorization` on official Anthropic replaces the
+ * `x-api-key` it requires, and every request 401s. Test and Save must both
+ * gate on this, or a connection test lies about a perfectly good key.
+ */
+export function sendsAuthHeader(
+  kind: LLMProviderKind,
+  supportsUrl: boolean,
+): boolean {
+  return KEY_BASED_KINDS.has(kind) && supportsUrl;
+}
 
 /** Provider kinds that need a base_url. */
 export const URL_BASED_KINDS: ReadonlySet<LLMProviderKind> = new Set([
   "ollama",
   "openai_compatible",
   "litellm",
+  "omniroute",
+]);
+
+/** Cloud providers that may use a compatible gateway instead of their default API. */
+export const OPTIONAL_BASE_URL_KINDS: ReadonlySet<LLMProviderKind> = new Set([
+  "anthropic",
 ]);
 
 /** Tier slot identifiers. */
@@ -70,8 +115,8 @@ export type LLMProvider = LLMProviderKind;
 export const LLM_PROVIDERS = LLM_PROVIDER_KINDS;
 export const LLM_PROVIDER_LABELS = LLM_PROVIDER_KIND_LABELS;
 
-export type STTProvider = "openai" | "groq" | "sarvam" | "local";
-export type TTSProvider = "edge" | "elevenlabs" | "sarvam";
+export type STTProvider = "openai" | "groq" | "sarvam" | "local" | "usejarvis";
+export type TTSProvider = "edge" | "elevenlabs" | "sarvam" | "usejarvis";
 
 /**
  * Per-provider summary returned by GET /api/config/llm. The credential value
@@ -82,6 +127,7 @@ export interface LLMConfigProviderView {
   kind: LLMProviderKind;
   has_api_key: boolean;
   base_url?: string;
+  auth_header?: string;
 }
 
 /**
@@ -108,6 +154,23 @@ export interface LLMConfig {
     low: string | null;
   };
   available_kinds: LLMProviderKind[];
+  /**
+   * True on hosted installs: the system-owned usejarvis_ai provider is
+   * injected into the running config (and hidden from `providers` above so
+   * its base_url never reaches the client). The tab renders a read-only
+   * "included with your plan" card and offers `usejarvis_ai:*` model refs.
+   */
+  hosted_llm?: boolean;
+  /**
+   * Routing reality, computed by the daemon from the SAME per-slot resolution
+   * the binding paths use (explicit ref → llm.default → plan alias). The UI
+   * renders THIS for "what will actually run", never a re-derivation — the
+   * persisted `tiers`/`default` above stay pure user intent.
+   */
+  effective?: {
+    mode: "single" | "router-first";
+    tiers: Record<LLMTier, { ref: string | null; source: "choice" | "default" | "plan" | null }>;
+  };
 }
 
 /** Helper: split a "provider:model" reference into its parts. */
@@ -135,6 +198,10 @@ export interface ChannelConfig {
 
 export interface STTConfig {
   provider: string;
+  /** True on hosted installs: the "Usejarvis AI (included)" option applies. */
+  usejarvis_available?: boolean;
+  /** ISO-639-1 hint for the Whisper-shaped providers; '' = auto-detect. */
+  language?: string;
   has_openai_key: boolean;
   has_groq_key: boolean;
   has_sarvam_key: boolean;
@@ -145,6 +212,8 @@ export interface STTConfig {
 export interface TTSConfig {
   enabled: boolean;
   provider: string;
+  /** True on hosted installs: the "Usejarvis AI (included)" option applies. */
+  usejarvis_available?: boolean;
   voice: string;
   rate: string;
   volume: string;
@@ -239,11 +308,33 @@ export interface RoleInfo {
 }
 
 export interface GoogleStatus {
-  status: "not_configured" | "credentials_saved" | "connected";
-  has_credentials: boolean;
+  status:
+    | "not_configured"
+    | "credentials_saved"
+    | "connected"
+    | "not_connected"
+    /** The grant is gone (revoked, or expired). Tokens may still be on disk. */
+    | "reconnect_required";
+  /**
+   * Google is usable on this instance. NOT "credentials are present": a managed
+   * instance has none by design — the control plane holds them — so the old name
+   * was false for exactly the mode it most had to describe.
+   */
+  configured: boolean;
   is_authenticated: boolean;
   scopes: string[];
   token_expiry: number | null;
+  /**
+   * Control-plane MANAGED (hosted). The credentials came from the system config
+   * and the account is connected through the control plane, so this daemon's own
+   * OAuth flow does not apply — its redirect URI is this instance's hostname,
+   * which is not registered with Google.
+   */
+  managed?: boolean;
+  /** Why a reconnect is needed, when `status` is "reconnect_required". */
+  reconnect_reason?: string;
+  /** Where the user connects, when managed. */
+  connect_url?: string;
 }
 
 export interface SidecarInfo {
@@ -258,6 +349,10 @@ export interface SidecarInfo {
   platform?: string;
   capabilities?: string[];
   unavailable_capabilities?: Array<{ name: string; reason: string }>;
+  /** Sidecar's own (brain-decoupled) version, "dev" for local builds */
+  version?: string;
+  /** Compatibility verdict while connected: 'ok' | 'suggested' | 'dev' */
+  update_status?: "ok" | "suggested" | "blocked" | "dev";
 }
 
 export interface UserProfileQuestion {
@@ -286,8 +381,10 @@ export interface UserProfileResponse {
 }
 
 export type ActionResult =
-  | { ok: true; message: string; restartRequired?: boolean }
+  | { ok: true; message: string }
   | { ok: false; message: string };
+
+export type ProviderTestResult = ActionResult & { models?: string[] };
 
 async function getJson<T>(url: string): Promise<T | null> {
   try {
@@ -317,12 +414,35 @@ async function postJson<T>(
 }
 
 /**
+ * Apply a freshly-fetched value to state only when it actually differs from
+ * the current one. Every poll's `fetch` produces a brand-new object even when
+ * the data is byte-for-byte identical; setting state with that new reference
+ * churns `===` identity and needlessly re-fires every downstream
+ * `useEffect([obj])` across the settings tabs. That churn is what let the 10s
+ * poll clobber in-progress form edits (issue #238). Comparing by JSON keeps
+ * the previous reference stable when nothing changed, so dependent effects
+ * only run on a real data change.
+ *
+ * Use it as the functional state updater: `setX((prev) => preserveRef(prev, next))`.
+ *
+ * Safe here because every payload is plain JSON straight from `fetch`, and
+ * `prev` came from the same server serializer, so key ordering is stable.
+ */
+function preserveRef<T>(prev: T, next: T): T {
+  try {
+    return JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+  } catch {
+    return next;
+  }
+}
+
+/**
  * Settings Room data hook.
  *
  * Polls the 8 read endpoints in parallel every 10s (paused while tab
  * hidden). Exposes lifecycle actions that all return ActionResult so the
- * UI can show a per-action toast and bubble up `restartRequired` to the
- * room-level restart banner.
+ * UI can show a per-action toast. Settings are hot-applied by the daemon
+ * (channels, STT, TTS, Google observers), so no restart tracking.
  *
  * Voice actions land on the same lifecycle methods through the room
  * action bus, so behaviour is identical for clicks vs voice.
@@ -341,7 +461,6 @@ export function useSettingsData() {
   const [google, setGoogle] = useState<GoogleStatus | null>(null);
   const [sidecars, setSidecars] = useState<SidecarInfo[]>([]);
   const [profile, setProfile] = useState<UserProfileResponse | null>(null);
-  const [restartPending, setRestartPending] = useState(false);
   const [loading, setLoading] = useState(true);
   const inFlightRef = useRef(false);
 
@@ -378,19 +497,22 @@ export function useSettingsData() {
         getJson<SidecarInfo[]>("/api/sidecars"),
         getJson<UserProfileResponse>("/api/user-profile"),
       ]);
-      if (llmR) setLLM(llmR);
-      if (chanStatusR) setChannelStatus(chanStatusR);
-      if (chanCfgR) setChannelCfg(chanCfgR);
-      if (sttR) setSTTCfg(sttR);
-      if (ttsR) setTTSCfg(ttsR);
-      if (voiceR) setVoiceCfg(voiceR);
-      if (autoR) setAutostart(autoR);
-      if (rootR) setRootCfg(rootR);
-      if (persR) setPersonality(persR);
-      if (roleR) setRole(roleR);
-      if (gR) setGoogle(gR);
-      if (scR) setSidecars(scR);
-      if (profR) setProfile(profR);
+      // Functional updaters + preserveRef: keep the previous object reference
+      // when the re-fetched payload is unchanged, so dependent effects in the
+      // tabs don't re-fire on every poll (see preserveRef / issue #238).
+      if (llmR) setLLM((p) => preserveRef(p, llmR));
+      if (chanStatusR) setChannelStatus((p) => preserveRef(p, chanStatusR));
+      if (chanCfgR) setChannelCfg((p) => preserveRef(p, chanCfgR));
+      if (sttR) setSTTCfg((p) => preserveRef(p, sttR));
+      if (ttsR) setTTSCfg((p) => preserveRef(p, ttsR));
+      if (voiceR) setVoiceCfg((p) => preserveRef(p, voiceR));
+      if (autoR) setAutostart((p) => preserveRef(p, autoR));
+      if (rootR) setRootCfg((p) => preserveRef(p, rootR));
+      if (persR) setPersonality((p) => preserveRef(p, persR));
+      if (roleR) setRole((p) => preserveRef(p, roleR));
+      if (gR) setGoogle((p) => preserveRef(p, gR));
+      if (scR) setSidecars((p) => preserveRef(p, scR));
+      if (profR) setProfile((p) => preserveRef(p, profR));
     } finally {
       inFlightRef.current = false;
       setLoading(false);
@@ -411,7 +533,9 @@ export function useSettingsData() {
     let providersWithKey = 0;
     if (llm) {
       for (const entry of Object.values(llm.providers ?? {})) {
-        if (URL_BASED_KINDS.has(entry.kind) ? entry.base_url : entry.has_api_key) {
+        const usesUrl = URL_BASED_KINDS.has(entry.kind);
+        const needsKey = KEY_BASED_KINDS.has(entry.kind) && !OPTIONAL_KEY_KINDS.has(entry.kind);
+        if ((!usesUrl || !!entry.base_url?.trim()) && (!needsKey || entry.has_api_key)) {
           providersWithKey++;
         }
       }
@@ -426,9 +550,8 @@ export function useSettingsData() {
       channelsEnabled,
       sidecarsConnected,
       sidecarsTotal: sidecars.length,
-      restartPending,
     };
-  }, [llm, channelCfg, ttsCfg, sidecars, restartPending]);
+  }, [llm, channelCfg, ttsCfg, sidecars]);
 
   // ── LLM actions (hot-reloaded) ──────────────────────────────────────
 
@@ -436,8 +559,8 @@ export function useSettingsData() {
   const upsertProvider = useCallback(
     async (
       name: string,
-      input: { kind?: LLMProviderKind; api_key?: string; base_url?: string },
-    ): Promise<ActionResult> => {
+      input: { kind?: LLMProviderKind; api_key?: string; base_url?: string; auth_header?: string },
+    ): Promise<ProviderTestResult> => {
       try {
         const r = await postJson<{ ok: boolean; message: string }>(
           "/api/config/llm",
@@ -570,20 +693,23 @@ export function useSettingsData() {
   const testProvider = useCallback(
     async (
       name: string,
-      overrides?: { kind?: LLMProviderKind; model?: string; baseUrl?: string; apiKey?: string },
-    ): Promise<ActionResult> => {
+      overrides?: { kind?: LLMProviderKind; model?: string; baseUrl?: string; apiKey?: string; authHeader?: string },
+    ): Promise<ProviderTestResult> => {
       try {
         const body: Record<string, unknown> = { name };
         if (overrides?.kind) body.kind = overrides.kind;
         if (overrides?.model) body.model = overrides.model;
-        if (overrides?.baseUrl) body.base_url = overrides.baseUrl;
+        if (overrides && Object.hasOwn(overrides, "baseUrl")) {
+          body.base_url = overrides.baseUrl ?? "";
+        }
         if (overrides?.apiKey) body.api_key = overrides.apiKey;
-        const r = await postJson<{ ok: boolean; model?: string; error?: string }>(
+        if (overrides?.authHeader) body.auth_header = overrides.authHeader;
+        const r = await postJson<{ ok: boolean; model?: string; models?: string[]; error?: string }>(
           "/api/config/llm/test",
           body,
         );
         if (r.ok) {
-          return { ok: true, message: `${name}: ${r.model ?? "connected"}.` };
+          return { ok: true, message: `${name}: ${r.model ?? "connected"}.`, models: r.models };
         }
         return { ok: false, message: r.error ?? "Test failed." };
       } catch (err) {
@@ -593,7 +719,7 @@ export function useSettingsData() {
     [],
   );
 
-  // ── Channels (restart required) ─────────────────────────────────────
+  // ── Channels (hot-applied by the daemon) ────────────────────────────
   const setTelegram = useCallback(
     async (input: {
       enabled?: boolean;
@@ -601,14 +727,14 @@ export function useSettingsData() {
       allowed_users?: number[];
     }): Promise<ActionResult> => {
       try {
-        await postJson("/api/config/channels", { telegram: input });
-        setRestartPending(true);
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/channels",
+          { telegram: input },
+        );
         await refresh();
-        return {
-          ok: true,
-          message: "Telegram saved. Restart Jarvis to apply.",
-          restartRequired: true,
-        };
+        return r.ok
+          ? { ok: true, message: r.message || "Telegram saved and applied." }
+          : { ok: false, message: r.message || "Failed to apply Telegram config." };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -624,14 +750,33 @@ export function useSettingsData() {
       guild_id?: string;
     }): Promise<ActionResult> => {
       try {
-        await postJson("/api/config/channels", { discord: input });
-        setRestartPending(true);
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/channels",
+          { discord: input },
+        );
         await refresh();
-        return {
-          ok: true,
-          message: "Discord saved. Restart Jarvis to apply.",
-          restartRequired: true,
-        };
+        return r.ok
+          ? { ok: true, message: r.message || "Discord saved and applied." }
+          : { ok: false, message: r.message || "Failed to apply Discord config." };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [refresh],
+  );
+
+  const setSTTLanguage = useCallback(
+    async (language: string): Promise<ActionResult> => {
+      try {
+        // '' = auto-detect; the daemon omits the param from provider requests.
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/stt",
+          { language },
+        );
+        await refresh();
+        return r.ok
+          ? { ok: true, message: r.message || "Transcription language saved." }
+          : { ok: false, message: r.message || "Failed to save transcription language." };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -658,14 +803,40 @@ export function useSettingsData() {
         } else if (extras?.api_key) {
           body[provider] = { api_key: extras.api_key };
         }
-        await postJson("/api/config/stt", body);
-        setRestartPending(true);
+        const r = await postJson<{ ok: boolean; message: string }>(
+          "/api/config/stt",
+          body,
+        );
         await refresh();
-        return {
-          ok: true,
-          message: `STT set to ${provider}. Restart Jarvis to apply.`,
-          restartRequired: true,
-        };
+        return r.ok
+          ? { ok: true, message: r.message || `STT set to ${provider}.` }
+          : { ok: false, message: r.message || "Failed to apply STT config." };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [refresh],
+  );
+
+  /**
+   * Reset a voice provider to the plan default (hosted installs).
+   *
+   * Sends `provider: null`, which the daemon turns into a DELETE of the
+   * recorded choice — not a write of 'usejarvis'. The hosted defaults key off
+   * an absent provider, so recording one would pin the account off its own
+   * plan; only silence keeps the default applying.
+   */
+  const resetVoiceProvider = useCallback(
+    async (section: "stt" | "tts"): Promise<ActionResult> => {
+      try {
+        const r = await postJson<{ ok: boolean; message: string }>(
+          `/api/config/${section}`,
+          { provider: null },
+        );
+        await refresh();
+        return r.ok
+          ? { ok: true, message: r.message || "Reset to your plan default." }
+          : { ok: false, message: r.message || "Failed to reset." };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
@@ -759,7 +930,6 @@ export function useSettingsData() {
         "/api/system/autostart/restart",
         {},
       );
-      setRestartPending(false);
       // Refetch later — daemon may be down briefly
       window.setTimeout(refresh, 3000);
       return { ok: true, message: r.message || "Restart scheduled." };
@@ -828,14 +998,14 @@ export function useSettingsData() {
 
   const disconnectGoogle = useCallback(async (): Promise<ActionResult> => {
     try {
-      await postJson("/api/auth/google/disconnect", {});
-      setRestartPending(true);
+      const r = await postJson<{ ok: boolean; message: string }>(
+        "/api/auth/google/disconnect",
+        {},
+      );
       await refresh();
-      return {
-        ok: true,
-        message: "Disconnected. Restart Jarvis to deactivate observers.",
-        restartRequired: true,
-      };
+      return r.ok
+        ? { ok: true, message: r.message || "Google disconnected. Observers stopped." }
+        : { ok: false, message: r.message || "Disconnect failed." };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Failed" };
     }
@@ -903,8 +1073,6 @@ export function useSettingsData() {
     // derived
     stats,
     loading,
-    restartPending,
-    setRestartPending,
 
     // actions
     refresh,
@@ -919,6 +1087,8 @@ export function useSettingsData() {
     setTelegram,
     setDiscord,
     setSTTProvider,
+    resetVoiceProvider,
+    setSTTLanguage,
     setTTS,
     setVoiceConfig,
     setHeartbeatInterval,

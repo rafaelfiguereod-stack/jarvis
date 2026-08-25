@@ -7,10 +7,18 @@ import type {
   LLMTool,
   LLMToolCall,
 } from './provider.ts';
-import { classifyHttpStatus } from './provider.ts';
+import { classifyHttpStatus, LLMProviderError } from './provider.ts';
+type GroqContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 type GroqMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  // Groq's chat API mirrors OpenAI; vision-capable models (e.g.
+  // llama-3.2-90b-vision, llava-v1.5-7b) accept user-message
+  // content as an array of text/image_url parts. Plain text users
+  // and non-user roles stay string for compat.
+  content: string | GroqContentPart[] | null;
   tool_calls?: GroqToolCall[];
   tool_call_id?: string;
 };
@@ -51,6 +59,7 @@ type GroqResponse = {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    prompt_tokens_details?: { cached_tokens?: number };
   };
 };
 
@@ -77,6 +86,23 @@ type GroqStreamChunk = {
     finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
   }>;
 };
+
+/**
+ * Models suitable for Jarvis chat + local function calling.
+ *
+ * Route shape only — deliberately NOT filtered against the deprecation map
+ * (see groq-models.ts). /models is answered per account, and Groq keeps
+ * serving retired IDs to committed-spend contracts past the public shutdown
+ * date. Hiding those would drop a model the account still owns, and since
+ * boot migration has already rewritten the saved reference, this picker is
+ * the only way back to it. The account's own catalog is the authority.
+ */
+export function isGroqJarvisModel(id: string): boolean {
+  // These catalog entries use audio (whisper/orpheus/tts), moderation
+  // (guard), or embedding endpoints, or (for Compound) reject user-provided
+  // local tools.
+  return !/(whisper|orpheus|playai|tts|guard|embed|^groq\/compound)/i.test(id);
+}
 
 /**
  * Groq strict-validates tool call arguments server-side against the
@@ -129,6 +155,8 @@ export class GroqProvider implements LLMProvider {
   private apiKey: string;
   private defaultModel: string;
   private apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
+  // Keep enough context for paid accounts. Free-tier quota failures carry a
+  // typed rate-limit error and are handled by the manager's retry/failover.
   private static readonly SAFE_PROMPT_CHAR_BUDGET = 24_000;
   private static readonly SAFE_TOOL_OVERHEAD_CHARS = 8_000;
   private static readonly RETRY_PROMPT_CHAR_BUDGET = 12_000;
@@ -138,7 +166,7 @@ export class GroqProvider implements LLMProvider {
   private static readonly MAX_TOOL_MESSAGE_CHARS = 2_000;
   private static readonly MIN_RECENT_MESSAGES = 6;
 
-  constructor(apiKey: string, defaultModel = 'llama-3.3-70b-versatile') {
+  constructor(apiKey: string, defaultModel = 'openai/gpt-oss-20b') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
   }
@@ -151,14 +179,14 @@ export class GroqProvider implements LLMProvider {
     if (!response.ok) {
       const errorText = await response.text();
       if (!this.isRequestTooLargeError(response.status, errorText)) {
-        throw new Error(`Groq API error (${response.status}): ${errorText}`);
+        throw this.httpError(response, errorText);
       }
       response = await this.sendRequest(
         this.buildRequestBody(messages, options, false, GroqProvider.RETRY_PROMPT_CHAR_BUDGET)
       );
       if (!response.ok) {
         const retryError = await response.text();
-        throw new Error(`Groq API error after retry (${response.status}): ${retryError}`);
+        throw this.httpError(response, retryError);
       }
     }
 
@@ -180,10 +208,12 @@ export class GroqProvider implements LLMProvider {
     if (!response.ok) {
       const errorText = await response.text();
       if (!this.isRequestTooLargeError(response.status, errorText)) {
+        const retryAfterMs = this.retryAfterMs(response);
         yield {
           type: 'error',
           error: `Groq API error (${response.status}): ${errorText}`,
           code: classifyHttpStatus(response.status),
+          ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
         };
         return;
       }
@@ -197,10 +227,12 @@ export class GroqProvider implements LLMProvider {
       );
       if (!response.ok) {
         const retryError = await response.text();
+        const retryAfterMs = this.retryAfterMs(response);
         yield {
           type: 'error',
           error: `Groq API error after retry (${response.status}): ${retryError}`,
           code: classifyHttpStatus(response.status),
+          ...(retryAfterMs !== undefined ? { retry_after_ms: retryAfterMs } : {}),
         };
         return;
       }
@@ -324,13 +356,12 @@ export class GroqProvider implements LLMProvider {
       }
 
       const data = await response.json() as { data: Array<{ id: string }> };
-      return data.data.map(m => m.id).sort();
+      return data.data.map(m => m.id).filter(isGroqJarvisModel).sort();
     } catch (_err) {
       return [
-        'llama-3.3-70b-versatile',
-        'llama-3.1-8b-instant',
-        'qwen/qwen3-32b',
-        'deepseek-r1-distill-llama-70b',
+        'openai/gpt-oss-20b',
+        'openai/gpt-oss-120b',
+        'qwen/qwen3.6-27b',
       ];
     }
   }
@@ -370,15 +401,44 @@ export class GroqProvider implements LLMProvider {
     });
   }
 
+  private retryAfterMs(response: Response): number | undefined {
+    const raw = response.headers.get('retry-after');
+    if (!raw) return undefined;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+    const dateMs = Date.parse(raw);
+    return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
+  }
+
+  private httpError(response: Response, detail: string): LLMProviderError {
+    return new LLMProviderError(
+      `Groq API error (${response.status}): ${detail}`,
+      classifyHttpStatus(response.status),
+      this.retryAfterMs(response),
+    );
+  }
+
   private convertMessages(messages: LLMMessage[]): GroqMessage[] {
     return messages.map(m => {
-      const text = typeof m.content === 'string'
-        ? m.content
-        : m.content.map((b) => b.type === 'text' ? b.text : '[image]').join('\n');
+      let content: string | GroqContentPart[];
+      if (typeof m.content === 'string') {
+        content = m.content;
+      } else if (m.role === 'user' && m.content.some(b => b.type === 'image')) {
+        content = m.content.map<GroqContentPart>((b) => {
+          if (b.type === 'text') return { type: 'text', text: b.text };
+          return {
+            type: 'image_url',
+            image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` },
+          };
+        });
+      } else {
+        content = m.content.map((b) => b.type === 'text' ? b.text : '[image]').join('\n');
+      }
       const hasToolCalls = !!(m.tool_calls && m.tool_calls.length > 0);
+      const trimmed = typeof content === 'string' ? content.trim() : '<parts>';
       const msg: GroqMessage = {
         role: m.role as 'system' | 'user' | 'assistant' | 'tool',
-        content: hasToolCalls && text.trim().length === 0 ? null : text,
+        content: hasToolCalls && trimmed.length === 0 ? null : content,
       };
       if (m.tool_calls && m.tool_calls.length > 0) {
         msg.tool_calls = m.tool_calls.map(tc => ({
@@ -572,8 +632,16 @@ export class GroqProvider implements LLMProvider {
       content,
       tool_calls,
       usage: {
-        input_tokens: response.usage.prompt_tokens,
+        // Normalized semantics (see LLMResponse.usage): input_tokens counts
+        // only UNCACHED prompt tokens. Groq's automatic prefix caching
+        // reports cached tokens OpenAI-style as a subset of prompt_tokens.
+        input_tokens: Math.max(
+          0,
+          response.usage.prompt_tokens - (response.usage.prompt_tokens_details?.cached_tokens ?? 0),
+        ),
         output_tokens: response.usage.completion_tokens,
+        ...(response.usage.prompt_tokens_details?.cached_tokens !== undefined
+          ? { cache_read_input_tokens: response.usage.prompt_tokens_details.cached_tokens } : {}),
       },
       model: response.model,
       finish_reason: this.mapFinishReason(choice!.finish_reason),

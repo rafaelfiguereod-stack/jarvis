@@ -508,6 +508,40 @@ console.log('Response:', response);
 
 ## Advanced Topics
 
+### Prompt Caching
+
+Provider-side prompt caching is enabled by default and controlled by the `llm.prompt_cache` setting (DB/dashboard-managed like the tier map; set `prompt_cache: false` via the LLM settings API to disable). Only an explicit `false` disables it.
+
+How it works per provider:
+
+- **Anthropic**: system prompts are sent as a block array with `cache_control` breakpoints. One breakpoint sits on the cache-marked static system block (caching tools + static prompt), a second on the last message of conversational requests (incremental caching across ReAct loop iterations and chat turns). Cache reads bill at ~0.1x input price, writes at 1.25x, with a 5-minute TTL. One-shot requests (no assistant turn) get no message breakpoint, so they never pay the write premium. Prefixes below the model's minimum cacheable size (1024-4096 tokens) silently don't cache and cost nothing extra.
+- **OpenAI**: caching is automatic server-side (~50% discount on cached prefixes over 1024 tokens); Jarvis just keeps stable content first in the prompt. Reported `cached_tokens` are surfaced in telemetry.
+- **OpenRouter**: most routed upstreams (OpenAI, Gemini 2.5, DeepSeek, Groq, Grok, Moonshot) cache automatically. For `anthropic/*` models Jarvis sends OpenRouter's top-level `cache_control: {type: "ephemeral"}` and OpenRouter places the breakpoints itself; it also sticky-routes follow-up requests to the same upstream endpoint to maximize hit rates. (`qwen/*` also needs explicit caching but only supports per-content-block breakpoints - not emitted yet.) Cached reads and writes come back in `prompt_tokens_details` and are surfaced in telemetry (both chat and streaming).
+- **Gemini**: implicit caching is automatic on 2.5+ models (2048-4096 token minimum); `cachedContentTokenCount` is surfaced in telemetry.
+- **Groq**: automatic prefix caching on supported models (50% discount, 2h TTL); `prompt_tokens_details.cached_tokens` is surfaced in telemetry.
+- **LiteLLM / OpenAI-compatible**: inherit the OpenAI client, so `cached_tokens` reported by the proxied backend is surfaced automatically.
+- **Usejarvis AI (hosted)**: explicit Anthropic-style breakpoints in OpenAI wire format — `cache_control` riding on content parts, since LiteLLM drops the top-level field OpenRouter accepts. **OFF by default**: emission is gated on the SYSTEM `usejarvis_ai.prompt_cache: true` opt-in (config.yaml, provisioner-written) *and* the user-level `llm.prompt_cache` switch. See "Usejarvis AI prompt caching" below for what the opt-in requires — as of 2026-08-19 it is HARD-BLOCKED on platform-side per-tenant upstream credentials (shared cache namespace). Streamed requests set `stream_options: {include_usage: true}` so cache telemetry is real on the conversational path.
+- **Ollama**: local KV-cache reuse is automatic and free; nothing is reported or billed.
+- **Other providers**: the cache markers are ignored; no behavior change.
+
+#### Usejarvis AI prompt caching — verification record and enablement conditions
+
+Initial live verification against the hosted proxy (previously cited as "docs/LLM.md, POC case 3"; recorded here since that file was never committed): a `cache_control` marker on a **system** content part and on a **user** content part both reached the Anthropic upstream intact through LiteLLM; the second identical call billed the marked prefix at the cache-read rate (~0.1x the platform's resale input price).
+
+**Platform-team measurements, 2026-08-19** — the three previously-open conditions are now verified, with one hard blocker:
+
+1. **Non-Anthropic upstreams — FAILED (per-provider forwarding).** The marker's fate depends on the upstream route: `openai/` upstreams receive `cache_control` **verbatim** (the 400 on real OpenAI — unknown content-part property — stands as the expected outcome), `gemini/` translation to generateContent drops it, `anthropic/` translation keeps it. The proxy does NOT strip globally, so the client-side `prompt_cache` gate is **required**, not provisional; enabling it on a plan whose aliases map to an `openai/` route would break that tier. Vendor-aware emission (per-alias vendor metadata in the catalog) would be needed to enable on mixed-vendor plans.
+2. **Tool-role translation — VERIFIED OK.** A marker on a `tool` message's content part is accepted, translated onto the inner text block inside `tool_result.content`, and Anthropic caches at that depth (measured write→read round trip: `cache_write=6193` then `cache_read=6193`). The client's rolling breakpoint anchors on the last **user** message, which is therefore correct; anchoring on the true last message (the tool result) is an available optimization — deliberately not taken, to keep behavior independent of this LiteLLM translation detail.
+3. **Cache scoping — FAILED, HARD BLOCKER.** The prompt cache namespace follows the upstream credential, and the proxy holds ONE upstream api_key shared by every tenant; per-tenant virtual keys, user_ids, and LiteLLM users do NOT scope it. Measured: tenant B received `cache_read=7002` on a prefix only tenant A had ever sent. This is a working cross-tenant confirmation oracle (byte-level prefix guessing via `cache_read_input_tokens`) plus a billing asymmetry (A pays the 1.25x write premium, B reads at 0.1x for free). **`usejarvis_ai.prompt_cache` must remain `false` fleet-wide until the platform ships per-tenant upstream credentials.** The fix is platform-side; no client mitigation exists.
+
+Streaming telemetry note (also platform-verified 2026-08-19): the proxy honours `stream_options: {include_usage: true}` and includes `cache_read_input_tokens` / `prompt_tokens_details.cached_tokens`, but the usage rides on the **last content chunk** (`choices` length 1) — there is no empty-choices terminal chunk. The parser reads usage from whichever chunk carries it, handling both this shape and OpenAI's empty-choices terminal shape.
+
+Internals for callers: `LLMMessage.cache: true` marks a system message as a stable cache boundary. System prompts are built split into a static (byte-stable per role/channel) prefix and a dynamic per-turn suffix (`buildSystemPromptParts` in `src/roles/prompt-builder.ts`); volatile content (current time, observations, goals) must stay in the dynamic half or it invalidates the cache every turn. History trimming (`compactHistory`) uses page-aligned eviction so the retained prefix stays byte-stable between eviction events.
+
+Note: as part of this work, the rendered system prompt's section order changed slightly - the channel personality block now renders before `# Current Context` (previously after), and the conversation tier's task-state sections moved after its static instructions. Content is unchanged.
+
+Telemetry: `usage` on every response (and the `llm_usage` table / `/api/usage` route / Usage room) reports `cache_read_input_tokens` and `cache_creation_input_tokens`. `input_tokens` is normalized across providers to count only uncached, full-price tokens - the full prompt size is `input + cache_read + cache_creation`.
+
 ### Custom Provider Implementation
 
 Create your own provider:

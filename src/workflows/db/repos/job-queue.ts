@@ -188,6 +188,39 @@ export function getJob<P = Record<string, unknown>>(id: string): Job<P> | null {
   return row ? rowToJob<P>(row) : null;
 }
 
+/**
+ * Boot-time recovery (UPDATES.md graceful-drain resume). The daemon is
+ * single-process, so any job still `RUNNING` at startup was orphaned by the
+ * previous process's death (crash, or a drain that exceeded its deadline).
+ * Reset such jobs to `QUEUED` with the lease cleared and `scheduled_at=now` so
+ * the worker re-claims them IMMEDIATELY, instead of waiting out the (up to
+ * `leaseMs`, default 5-min) lease lapse. The run re-executes from its last
+ * durable checkpoint. Returns how many jobs were recovered. Must run BEFORE the
+ * worker starts polling.
+ */
+export function recoverOrphanedJobs(): number {
+  const ts = nowMs();
+  const d = db();
+  // Poison guard: a job that already hit its attempt ceiling terminates as
+  // FAILED instead of re-running (and possibly re-crashing the daemon on) its
+  // side-effectful steps in a tight boot loop forever. `claimNextJob` doesn't
+  // check max_attempts, so recovery must.
+  d.run(
+    `UPDATE workflow_job
+     SET status = 'FAILED', last_error = 'orphaned: max attempts exhausted', locked_until = NULL, updated = ?
+     WHERE status = 'RUNNING' AND attempt >= max_attempts`,
+    [ts],
+  );
+  // The rest re-queue for immediate re-claim.
+  const res = d.run(
+    `UPDATE workflow_job
+     SET status = 'QUEUED', locked_until = NULL, scheduled_at = ?, updated = ?
+     WHERE status = 'RUNNING' AND attempt < max_attempts`,
+    [ts, ts],
+  );
+  return res.changes;
+}
+
 export function completeJob(id: string): void {
   const ts = nowMs();
   const res = db().run(

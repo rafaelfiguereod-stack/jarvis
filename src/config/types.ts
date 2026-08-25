@@ -15,8 +15,66 @@ export type SystemCronConfig = {
 };
 
 export type GoogleConfig = {
-  client_id: string;
-  client_secret: string;
+  /**
+   * SELF-HOSTED ONLY. Absent on a control-plane managed instance, which holds no
+   * Google client credentials at all — see `refresh_url`. Optional so the
+   * compiler makes every reader face that case instead of trusting a `''`.
+   */
+  client_id?: string;
+  client_secret?: string;
+  /**
+   * HOSTED ONLY (usejarvis, GOOGLE.md "Push bridging"). Present when the control
+   * plane runs a push bridge: Google notifies it, and it rings this instance's
+   * doorbell so a change reflects in seconds instead of on the next poll.
+   *
+   * All three absent = self-hosted, or a deployment with no bridge. Polling then
+   * covers everything, which is the designed fallback rather than a degraded
+   * mode — so nothing here is required and nothing fails without it.
+   */
+  /** HMAC key the inbound doorbell is verified with (per instance). */
+  notify_secret?: string;
+  /** Pub/Sub topic to point Gmail's users.watch at. */
+  pubsub_topic?: string;
+  /** The bridge's public URL, for Calendar's events.watch callback. */
+  push_callback?: string;
+  /**
+   * The token to set on the Calendar watch, which Google echoes back to the
+   * bridge so it can tell which instance a notification belongs to. Rendered
+   * whole by the control plane rather than built here from notify_secret — the
+   * derivation would then live in two codebases, and a drifted token is a
+   * notification the bridge refuses without anything looking wrong.
+   */
+  channel_token?: string;
+  /**
+   * Where the user connects Google, on the hosted account page.
+   *
+   * Its PRESENCE means this instance is control-plane MANAGED: there are no
+   * client credentials in this file at all, the tokens are delivered rather than
+   * obtained here, and this daemon's own OAuth flow must not run — its redirect
+   * URI is this instance's own hostname, which is not registered with Google and
+   * cannot be (there is one registered URI, on the control plane, precisely so a
+   * VPS move does not break it).
+   */
+  connect_url?: string;
+  /**
+   * HMAC key this instance SIGNS its refresh requests with (hosted only).
+   *
+   * A different key from notify_secret, which the DOORBELL is verified with. The
+   * two travel in opposite directions, and while one key served both, the same
+   * signature was valid at either endpoint — safe only because the two body
+   * shapes happen to be disjoint. Both are rendered whole by the control plane.
+   */
+  refresh_secret?: string;
+  /**
+   * Where this instance asks the control plane to refresh its access token.
+   *
+   * Present INSTEAD of client_id/client_secret on a managed instance: the
+   * control plane holds those and applies them on our behalf, so no shared
+   * credential sits in a file this daemon's own (tenant-owned) user can read.
+   */
+  refresh_url?: string;
+  /** This instance's control-plane id, used to name itself when refreshing. */
+  instance_id?: string;
 };
 
 export type ChannelConfig = {
@@ -90,7 +148,21 @@ export type VoiceConfig = {
 };
 
 export type STTConfig = {
-  provider: 'openai' | 'groq' | 'local' | 'sarvam';
+  /**
+   * `usejarvis` is a pure string choice: the hosted "Usejarvis AI" STT rides
+   * the system-owned `usejarvis_ai` credentials, which are threaded to
+   * createSTTProvider as a separate argument and NEVER stored here (this
+   * section persists as plaintext JSON in the DB settings store).
+   */
+  provider: 'openai' | 'groq' | 'local' | 'sarvam' | 'usejarvis';
+  /**
+   * ISO-639-1 hint sent to the Whisper-shaped providers (openai / groq /
+   * local / usejarvis). Unset = auto-detect (the `language` param is omitted
+   * from the request entirely) — a hosted product cannot assume its users
+   * speak English, and Whisper detects reliably. Sarvam keeps its own
+   * `sarvam.language` (different API, different codes).
+   */
+  language?: string;
   openai?: { api_key: string; model?: string };
   groq?: { api_key: string; model?: string };
   local?: { endpoint: string; model?: string; server_type?: 'whisper_cpp' | 'openai_compatible' };
@@ -99,7 +171,12 @@ export type STTConfig = {
 
 export type TTSConfig = {
   enabled: boolean;
-  provider?: 'edge' | 'elevenlabs' | 'sarvam';  // default: 'edge'
+  /**
+   * Default: 'edge'. `usejarvis` is a pure string choice like the STT one:
+   * the hosted credentials ride the factory's separate `hosted` argument
+   * (never this persisted section).
+   */
+  provider?: 'edge' | 'elevenlabs' | 'sarvam' | 'usejarvis';
   voice?: string;       // e.g. 'en-US-AriaNeural' (edge)
   rate?: string;        // e.g. '+0%', '+10%' (edge)
   volume?: string;      // e.g. '+0%' (edge)
@@ -180,6 +257,35 @@ export type WorkflowConfig = {
   defaultTimeoutMs: number;
   selfHealEnabled: boolean;
   autoSuggestEnabled: boolean;
+  /**
+   * How long an idle warm engine subprocess stays parked before being
+   * killed, in ms. The parked engine holds ~100MB RSS; hosts that prefer
+   * RAM over the respawn cost can lower this. Default 5 minutes. Must be
+   * positive — non-positive values are ignored with a warning. The
+   * JARVIS_ENGINE_IDLE_TTL_MS env var overrides this setting (workflows is
+   * a user-owned section, so fleet operators tune via env instead).
+   */
+  engineIdleTtlMs?: number;
+  /**
+   * Where the workflow runtime finds READY-MADE artifacts instead of
+   * building/installing its own. All optional; each path may contain a
+   * `${version}` placeholder expanded from the `JARVIS_VERSION` env var
+   * (useful when one machine keeps artifacts per installed version). Any
+   * unset/missing path just means jarvis does the work itself, as usual.
+   * The JARVIS_ENGINE_CACHE_ROOT / JARVIS_SHARED_PIECES_DIR /
+   * JARVIS_PIECE_METADATA_CACHE env vars are honored as fallbacks; config
+   * wins when both are set.
+   */
+  /** Dir holding prebuilt engine bundles as `<hash>/main.js` — consulted
+   * before building into `~/.jarvis/cache/engine`. */
+  engine_dir?: string;
+  /** Dir with a ready-made pieces catalog (`node_modules/@activepieces/...`).
+   * Pieces here are usable without installing; a piece installed via the
+   * Library into `~/.jarvis/pieces` shadows the copy found here. */
+  pieces_dir?: string;
+  /** A prebuilt piece-metadata cache FILE (the per-entry JSON the catalog
+   * builder writes) — boots skip extraction for every piece it covers. */
+  piece_metadata_cache?: string;
 };
 
 export type GoalConfig = {
@@ -193,8 +299,15 @@ export type GoalConfig = {
 };
 
 export type AuthConfig = {
-  /** Shared secret token. If unset, auth is disabled (open access). Env: JARVIS_AUTH_TOKEN */
-  token?: string;
+  /**
+   * DANGEROUS - allow dashboard/API access WITHOUT an enrolled-device token.
+   * The brain is JWT-only by default: enroll a device (`jarvis enroll`) and
+   * connect through the sidecar. Set this ONLY for first-time self-host
+   * setup before any device is enrolled, and remove it as soon as
+   * enrollment is done. The daemon logs a loud warning while it is on.
+   * SYSTEM-owned (config.yaml); there is no shared auth token anymore.
+   */
+  insecure_open_access?: boolean;
 };
 
 export type UserConfig = {
@@ -212,9 +325,9 @@ export type TelemetryConfig = {
 };
 
 /**
- * Onboarding completion state — persists in `~/.jarvis/config.yaml` so
- * the dashboard knows which phase (setup / profile interview / tutorial)
- * to show on next load. Each `*_completed_at` is a `Date.now()` stamp;
+ * Onboarding completion state — persists in the vault DB settings store
+ * (user-owned section) so the dashboard knows which phase (setup / profile
+ * interview / tutorial) to show on next load. Each `*_completed_at` is a `Date.now()` stamp;
  * `null` means not yet done. Reset endpoint clears subsets per scope.
  *
  * See `docs/ONBOARDING_PLAN.md` for the gate logic and reset semantics.
@@ -249,7 +362,11 @@ export type LLMProviderKind =
   | 'openrouter'
   | 'nvidia'
   | 'openai_compatible'
-  | 'litellm';
+  | 'litellm'
+  | 'omniroute'
+  // Hosted "Usejarvis AI": the platform's LLM proxy, configured exclusively
+  // by the root-owned config.yaml `usejarvis_ai` block (never the dashboard).
+  | 'usejarvis_ai';
 
 /**
  * Credentials + endpoint for one provider instance. The `kind` field is
@@ -263,8 +380,17 @@ export type LLMProviderEntry = {
   kind?: LLMProviderKind;
   /** API key for cloud providers. */
   api_key?: string;
-  /** Base URL for self-hosted / local providers (ollama, openai-compatible, litellm). */
+  /** Base URL for local providers and compatible API gateways. */
   base_url?: string;
+  /** Header used to send api_key. Authorization values are prefixed with Bearer. */
+  auth_header?: string;
+  /**
+   * usejarvis_ai entries only: the system-block prompt-cache opt-in,
+   * carried through by applyUsejarvisAi so the binding layer can see it.
+   * Unlike the user-level `llm.prompt_cache` toggle (default ON), this
+   * defaults OFF — see the `usejarvis_ai.prompt_cache` block comment.
+   */
+  prompt_cache?: boolean;
 };
 
 /**
@@ -309,14 +435,63 @@ export type LLMConfig = {
    * (low/medium/high) without an explicit assignment fall up.
    */
   tiers?: LLMTiersConfig;
+
+  /**
+   * Provider-side prompt caching (Anthropic cache_control; OpenAI caching is
+   * automatic). DB/dashboard-sourced like `tiers` - never read from
+   * config.yaml. Absent means enabled; only an explicit false disables it.
+   */
+  prompt_cache?: boolean;
 };
 
 export type JarvisConfig = {
+  /**
+   * Hosted-LLM access (SYSTEM-owned, file-authoritative): written by the
+   * hosting provisioner into the root-owned config.yaml, never by the brain
+   * or dashboard. Survives the user-section discard (not listed in
+   * USER_OWNED_SECTIONS) and is re-applied over every DB merge by
+   * applyUsejarvisAi (daemon/usejarvis-ai.ts). Absent on self-hosted installs.
+   */
+  usejarvis_ai?: {
+    base_url?: string;
+    api_key?: string;
+    /**
+     * OPT-IN for Anthropic prompt-cache breakpoints on hosted LLM calls
+     * (margin-critical when on: cached reads bill at ~0.1x fresh input).
+     * Absent/false means OFF.
+     *
+     * MUST REMAIN false FLEET-WIDE until the platform ships per-tenant
+     * upstream credentials. Platform-verified 2026-08-19: the prompt cache
+     * namespace follows the single upstream api_key shared by every tenant
+     * — a cross-tenant cache_read on a never-sent prefix was measured. A
+     * shared namespace is a byte-level confirmation oracle on other
+     * tenants' prompt prefixes (plus a 1.25x-write/0.1x-read billing
+     * asymmetry), and no client-side mitigation exists. The fix is
+     * platform-side; do not write `true` before it lands.
+     *
+     * Also verified 2026-08-19: cache_control forwarding is per-provider
+     * (openai/ upstreams receive the marker VERBATIM — 400 risk — while
+     * gemini/ drops it and anthropic/ translates and keeps it), so this
+     * gate stays required even after the namespace fix unless emission
+     * becomes vendor-aware; markers on tool-role messages ARE translated
+     * and honoured (cached at tool_result.content depth), so the
+     * last-user-message breakpoint anchor is safe.
+     */
+    prompt_cache?: boolean;
+  };
   user?: UserConfig;
   onboarding?: OnboardingConfig;
   telemetry?: TelemetryConfig;
   daemon: {
     port: number;
+    /**
+     * SYSTEM-owned listen address. When set to `unix:/absolute/path.sock`
+     * the daemon binds a unix-domain socket INSTEAD of the TCP port (no
+     * port is opened at all). Hosted instances use this so Caddy is the
+     * only way in: `listen: unix:/run/jarvis/u_<id>.sock`. Omit for the
+     * self-host default (TCP on `port`).
+     */
+    listen?: string;
     data_dir: string;
     db_path: string;
     /**
@@ -333,7 +508,8 @@ export type JarvisConfig = {
      * (`brain.example.com`, `10.0.0.5:3142`). Bare local hosts default to
      * ws/http; everything else defaults to wss/https.
      *
-     * Precedence: `JARVIS_BRAIN_DOMAIN` env var > this field > internal
+     * Legacy alias for `public_url`. Precedence is `JARVIS_PUBLIC_URL` /
+     * `public_url`, then `JARVIS_BRAIN_DOMAIN` / this field, then the internal
      * `localhost:<port>` fallback (with a startup warning).
      *
      * Sidecars must be able to reach both derived endpoints from the
@@ -341,8 +517,33 @@ export type JarvisConfig = {
      * the token is re-issued with a reachable origin.
      */
     brain_domain?: string;
+    /**
+     * Canonical public HTTP(S) origin for OAuth callbacks, webhooks, dashboard
+     * links, and sidecar enrollment. Prefer this clearer name for new
+     * deployments; `brain_domain` remains a backwards-compatible alias.
+     * Must be an origin with no path, query, fragment, or credentials.
+     */
+    public_url?: string;
+    /**
+     * Graceful-drain deadline (ms). On SIGTERM the daemon quiesces (stops
+     * accepting new work) and waits up to this long for in-flight agent turns
+     * and workflow runs to reach a safe point before tearing down. Kept UNDER
+     * the supervisor's kill grace (hosted: systemd `TimeoutStopSec=90`) so the
+     * drain finishes before SIGKILL. Default 75s.
+     */
+    drain_deadline_ms?: number;
   };
   auth?: AuthConfig;
+  /**
+   * SYSTEM-owned (config.yaml, not the DB): whether a LOCAL Chrome may be
+   * launched on this machine. Hosted instances set `local: false` so no CDP
+   * ports ever open on the VPS; browser actions route to a connected
+   * sidecar's browser instead (the tools already prefer a `browser`-capable
+   * sidecar and only fall back to local).
+   */
+  browser?: {
+    local?: boolean;
+  };
   google?: GoogleConfig;
   channels?: ChannelConfig;
   stt?: STTConfig;
@@ -369,6 +570,14 @@ export type JarvisConfig = {
   heartbeat: HeartbeatConfig;
   cron?: SystemCronConfig;
   active_role: string;  // role file name
+  /**
+   * SYSTEM-owned: the user's IANA timezone (e.g. "America/New_York").
+   * Hosted brains run on UTC VPSs; the hosting server writes this (from the
+   * sidecar-reported value) so morning/evening crons, workflow triggers and
+   * goal windows fire at the user's wall-clock times. Self-host: omit to use
+   * the machine's local time.
+   */
+  timezone?: string;
 };
 
 export const DEFAULT_CONFIG: JarvisConfig = {
@@ -382,6 +591,9 @@ export const DEFAULT_CONFIG: JarvisConfig = {
     port: 3142,
     data_dir: '~/.jarvis',
     db_path: '~/.jarvis/jarvis.db',
+  },
+  browser: {
+    local: true,
   },
   channels: {
     telegram: { enabled: false, bot_token: '', allowed_users: [] },
@@ -469,3 +681,42 @@ export const DEFAULT_CONFIG: JarvisConfig = {
   },
   active_role: 'personal-assistant',
 };
+
+/**
+ * Config sections that are USER-OWNED: they live in the vault DB settings
+ * store (managed from the dashboard), never in config.yaml. loadConfig
+ * discards any such section found in the file (after a one-time legacy
+ * import at daemon boot; see daemon/user-settings.ts), exactly like the
+ * `llm` block. config.yaml keeps only network/system/hosting keys:
+ * daemon.*, auth, google (system-owned when present in the file).
+ */
+export const USER_OWNED_SECTIONS = [
+  'user',
+  'onboarding',
+  'telemetry',
+  'personality',
+  'active_role',
+  'authority',
+  'heartbeat',
+  'cron',
+  'stt',
+  'tts',
+  'voice',
+  'channels',
+  'desktop',
+  'awareness',
+  'sites',
+  'goals',
+  'workflows',
+] as const satisfies readonly (keyof JarvisConfig)[];
+
+export type UserOwnedSection = (typeof USER_OWNED_SECTIONS)[number];
+
+/**
+ * The SYSTEM-owned keys of the otherwise user-owned `workflows` section:
+ * ready-made artifact paths a deployment (e.g. a managed host) writes into
+ * config.yaml. The FILE wins for these — loadConfig preserves them through
+ * the user-section discard and the DB merge re-applies them on top, so a
+ * dashboard save of the user-tunable workflow fields can never strip them.
+ */
+export const WORKFLOW_SYSTEM_KEYS = ["engine_dir", "pieces_dir", "piece_metadata_cache"] as const;

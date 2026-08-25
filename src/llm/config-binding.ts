@@ -26,6 +26,8 @@ import { OpenRouterProvider } from './openrouter.ts';
 import { NVIDIAProvider } from './nvidia.ts';
 import { OpenAICompatibleProvider } from './openai-compatible.ts';
 import { LiteLLMProvider } from './litellm.ts';
+import { OmniRouteProvider } from './omniroute.ts';
+import { UsejarvisAIProvider } from './usejarvis.ts';
 
 /**
  * Instantiate a provider class from a single entry. Returns null when the
@@ -37,13 +39,27 @@ import { LiteLLMProvider } from './litellm.ts';
  * "ollama-local" + "ollama-remote") and model refs unambiguously route to
  * one specific instance.
  */
-export function instantiateProvider(name: string, entry: LLMProviderEntry): LLMProvider | null {
+/** Cross-provider settings that aren't part of a single provider entry. */
+export type ProviderGlobals = {
+  /** Provider-side prompt caching (Anthropic cache_control). Default true. */
+  promptCache?: boolean;
+};
+
+export function instantiateProvider(
+  name: string,
+  entry: LLMProviderEntry,
+  globals?: ProviderGlobals,
+): LLMProvider | null {
   const kind: LLMProviderKind = (entry.kind ?? name) as LLMProviderKind;
   let provider: LLMProvider | null = null;
   switch (kind) {
     case 'anthropic':
       if (!entry.api_key) return null;
-      provider = new AnthropicProvider(entry.api_key);
+      provider = new AnthropicProvider(entry.api_key, undefined, {
+        promptCache: globals?.promptCache !== false,
+        baseUrl: entry.base_url,
+        authHeader: entry.auth_header,
+      });
       break;
     case 'openai':
       if (!entry.api_key) return null;
@@ -59,7 +75,9 @@ export function instantiateProvider(name: string, entry: LLMProviderEntry): LLMP
       break;
     case 'openrouter':
       if (!entry.api_key) return null;
-      provider = new OpenRouterProvider(entry.api_key);
+      provider = new OpenRouterProvider(entry.api_key, undefined, {
+        promptCache: globals?.promptCache !== false,
+      });
       break;
     case 'nvidia':
       if (!entry.api_key) return null;
@@ -71,11 +89,27 @@ export function instantiateProvider(name: string, entry: LLMProviderEntry): LLMP
       break;
     case 'openai_compatible':
       if (!entry.base_url) return null;
-      provider = new OpenAICompatibleProvider(entry.base_url, undefined, entry.api_key);
+      provider = new OpenAICompatibleProvider(entry.base_url, undefined, entry.api_key, entry.auth_header);
       break;
     case 'litellm':
       if (!entry.base_url) return null;
-      provider = new LiteLLMProvider(entry.base_url, undefined, entry.api_key);
+      provider = new LiteLLMProvider(entry.base_url, undefined, entry.api_key, entry.auth_header);
+      break;
+    case 'omniroute':
+      provider = new OmniRouteProvider(entry.base_url?.trim() || undefined, undefined, entry.api_key, entry.auth_header);
+      break;
+    case 'usejarvis_ai':
+      // Hosted platform proxy: both values come from the system-owned
+      // config.yaml block (daemon/usejarvis-ai.ts) - nothing to guess.
+      if (!entry.base_url?.trim() || !entry.api_key?.trim()) return null;
+      provider = new UsejarvisAIProvider(entry.base_url.trim(), entry.api_key.trim(), {
+        // Anthropic prompt caching. OPT-IN via the system block (the uj-*
+        // aliases are vendor-opaque, so only the provisioner can assert the
+        // proxy strips markers for non-Anthropic upstreams — see
+        // usejarvis_ai.prompt_cache in config/types.ts), AND still subject
+        // to the user-level switch the anthropic/openrouter cases honour.
+        promptCache: entry.prompt_cache === true && globals?.promptCache !== false,
+      });
       break;
     default:
       console.warn(`[LLM] Unknown provider kind '${kind}' for '${name}' - skipping.`);
@@ -96,11 +130,12 @@ export function instantiateProvider(name: string, entry: LLMProviderEntry): LLMP
  */
 export function buildProviders(
   providers: Record<string, LLMProviderEntry>,
+  globals?: ProviderGlobals,
 ): LLMProvider[] {
   const out: LLMProvider[] = [];
   for (const [name, entry] of Object.entries(providers)) {
     if (!entry) continue;
-    const provider = instantiateProvider(name, entry);
+    const provider = instantiateProvider(name, entry, globals);
     if (!provider) continue;
     out.push(provider);
     console.log(`[LLM] Built provider '${name}' (kind=${entry.kind ?? name})`);
@@ -116,8 +151,9 @@ export function buildProviders(
 export function registerLLMProviders(
   manager: LLMManager,
   providers: Record<string, LLMProviderEntry>,
+  globals?: ProviderGlobals,
 ): boolean {
-  const built = buildProviders(providers);
+  const built = buildProviders(providers, globals);
   for (const p of built) manager.registerProvider(p);
   return built.length > 0;
 }
@@ -130,8 +166,9 @@ export function registerLLMProviders(
 export function atomicReloadProviders(
   manager: LLMManager,
   providers: Record<string, LLMProviderEntry>,
+  globals?: ProviderGlobals,
 ): LLMProvider[] {
-  const built = buildProviders(providers);
+  const built = buildProviders(providers, globals);
   manager.replaceProviders(built, '', []);
   return built;
 }

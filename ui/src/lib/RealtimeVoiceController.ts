@@ -12,6 +12,7 @@
  */
 
 import { floatTo16BitPCM, pcm16ToFloat32, resampleFloat32 } from "./pcm.ts";
+import { uuid } from "./uuid.ts";
 
 const REALTIME_SAMPLE_RATE = 24000; // OpenAI realtime minimum.
 const CAPTURE_WORKLET_URL = "/audio/pcm-capture-processor.js";
@@ -70,11 +71,14 @@ export class RealtimeVoiceController {
       this.source = this.captureCtx.createMediaStreamSource(this.stream);
       this.worklet = new AudioWorkletNode(this.captureCtx, "pcm-capture-processor");
 
-      this.requestId = crypto.randomUUID();
+      this.requestId = uuid();
+      // mode:"pcm" tells the daemon raw realtime frames follow — if the plan
+      // gate refuses the session, the daemon must NOT open a WAV accumulator
+      // for them (headerless PCM is garbage to the standard pipeline).
       ws.send(
         JSON.stringify({
           type: "voice_start",
-          payload: { requestId: this.requestId, currentRoom: this.opts.getCurrentRoom?.() ?? "home" },
+          payload: { requestId: this.requestId, currentRoom: this.opts.getCurrentRoom?.() ?? "home", mode: "pcm" },
           timestamp: Date.now(),
         }),
       );

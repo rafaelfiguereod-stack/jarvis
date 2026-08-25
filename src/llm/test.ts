@@ -14,6 +14,7 @@ import { loadConfig } from '../config/index.ts';
 import { initDatabase } from '../vault/schema.ts';
 import { mergeLLMSettingsIntoConfig } from '../daemon/llm-settings.ts';
 import { registerLLMProviders, configureLLMTiers } from './config-binding.ts';
+import { setUsageDatabase } from './usage.ts';
 
 async function testProviders() {
   console.log('Loading config...');
@@ -21,16 +22,23 @@ async function testProviders() {
   // Tiers (and dashboard-saved providers) live in the DB, not config.yaml.
   // Merge them in so this diagnostic exercises the same routing the daemon
   // uses at runtime.
-  initDatabase(config.daemon.db_path);
-  mergeLLMSettingsIntoConfig(config);
+  const db = initDatabase(config.daemon.db_path);
+  setUsageDatabase(() => db);
+  mergeLLMSettingsIntoConfig(config, { persistMigrations: false });
 
   const manager = new LLMManager();
-  const hasProvider = registerLLMProviders(manager, config.llm.providers ?? {});
+  const hasProvider = registerLLMProviders(manager, config.llm.providers ?? {}, {
+    promptCache: config.llm.prompt_cache !== false,
+  });
   if (!hasProvider) {
     console.error('No providers configured.');
     return;
   }
-  configureLLMTiers(manager, config.llm);
+  // Routing view, not persisted intent — hosted tier defaults live only here
+  // (see effectiveLlmForBinding), so binding config.llm directly would leave
+  // this diagnostic with no tiers on a hosted install.
+  const { effectiveLlmForBinding } = await import('../daemon/usejarvis-ai.ts');
+  configureLLMTiers(manager, effectiveLlmForBinding(config));
 
   console.log(`Active providers: ${manager.getProviderNames().join(', ')}`);
   if (config.llm.default) console.log(`Default: ${config.llm.default}`);
@@ -64,6 +72,35 @@ async function testProviders() {
     }
   } catch (err) {
     console.error('Stream failed:', err);
+  }
+
+  // Prompt-cache round trip: send the same request twice with a large,
+  // cache-marked static system message. On providers with explicit caching
+  // (Anthropic) call 1 should report cache_creation_input_tokens > 0 and
+  // call 2 cache_read_input_tokens > 0. On OpenAI, call 2 may report
+  // cache_read_input_tokens via automatic caching. Note: prefixes below the
+  // model's minimum cacheable size (1024-4096 tokens) silently don't cache.
+  console.log('\nTesting prompt caching (two identical calls)...');
+  const staticFiller = Array.from(
+    { length: 220 },
+    (_, i) => `Rule ${i}: always be consistent, deterministic, and helpful when handling scenario number ${i}.`,
+  ).join('\n');
+  const cachedMessages = [
+    { role: 'system' as const, content: `You are a helpful assistant.\n\n${staticFiller}`, cache: true },
+    { role: 'system' as const, content: `Session context: manual cache test at ${new Date().toISOString()}` },
+    { role: 'user' as const, content: 'Reply with the single word: OK' },
+  ];
+  try {
+    for (const attempt of [1, 2]) {
+      const response = await manager.chatTier('medium', 'manual_cache_test', cachedMessages, { max_tokens: 16 });
+      console.log(
+        `Call ${attempt}: input=${response.usage.input_tokens}, ` +
+        `cache_creation=${response.usage.cache_creation_input_tokens ?? 0}, ` +
+        `cache_read=${response.usage.cache_read_input_tokens ?? 0}`,
+      );
+    }
+  } catch (err) {
+    console.error('Cache test failed:', err);
   }
 }
 

@@ -4,7 +4,8 @@
  *
  * Usage:
  *   jarvis start [--port N] [-d|--detach]   Start the daemon
- *   jarvis stop [--port N]                  Stop the running daemon
+ *   jarvis stop [--port N]                  Stop the running daemon (graceful drain)
+ *   jarvis drain [--port N]                 Graceful drain + stop (finish in-flight work)
  *   jarvis status                           Show daemon status
  *   jarvis uninstall                        Remove JARVIS (detects install method)
  *   jarvis doctor                           Check environment & connectivity
@@ -18,10 +19,11 @@
 import { join } from 'node:path';
 import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { acquireLock, releaseLock, isLocked, getLogPath } from '../src/daemon/pid.ts';
+import { acquireLock, releaseLock, releaseLockIfUnheld, isLocked, getLogPath, isProcessAlive, waitForProcessExit } from '../src/daemon/pid.ts';
 import { c } from '../src/cli/helpers.ts';
 import { ensurePortReleased, getConfiguredPort, resolveStopPort } from '../src/cli/lifecycle.ts';
 import { getInstalledVersion } from '../src/cli/version.ts';
+import { loadConfig } from '../src/config/loader.ts';
 
 const PACKAGE_ROOT = join(import.meta.dir, '..');
 
@@ -46,6 +48,11 @@ ${c.bold('Commands:')}
   ${c.cyan('update')}    Update JARVIS (dispatches based on install method)
   ${c.cyan('uninstall')} Remove JARVIS (dispatches based on install method)
   ${c.cyan('doctor')}    Check environment and connectivity
+  ${c.cyan('enroll')}    Enroll a sidecar device: mint + store its JWT (no daemon needed)
+  ${c.cyan('sidecars')}  List enrolled devices (sidecars list [--json])
+  ${c.cyan('revoke')}    Revoke an enrolled device by sid
+  ${c.cyan('export')}    Export user data as a tar archive (export [--out <path>|-] [--full])
+  ${c.cyan('restore')}   Restore user data from an export archive (restore <archive|->)
   ${c.cyan('version')}   Print version number
   ${c.cyan('help')}      Show this help message
 
@@ -68,6 +75,10 @@ ${c.bold('Examples:')}
   jarvis logs -f                Follow live log output
   jarvis update                 Update to latest version
   jarvis uninstall              Remove JARVIS from this machine
+  jarvis enroll "desktop-NA23"  Mint an enrollment token for a device
+  jarvis enroll <name> --rotate Re-enroll invalidating all previous tokens
+  jarvis sidecars list --json   List devices (machine-readable)
+  jarvis revoke <sid>           Revoke a device's access
   jarvis doctor                 Check if everything is working
 `);
 }
@@ -111,8 +122,12 @@ async function cmdStart(args: string[]): Promise<void> {
   const { homedir } = await import('node:os');
   const cfgPath = join(homedir(), '.jarvis', 'config.yaml');
   if (!_exists(cfgPath)) {
-    console.log(c.cyan('First-run detected — finish setup in your browser:'));
-    console.log(c.dim(`  → http://localhost:${port ?? 3142}`));
+    console.log(c.cyan('First-run detected. Jarvis is JWT-only by default:'));
+    console.log(c.dim('  1. jarvis enroll "<device-name>"   mint your device token'));
+    console.log(c.dim('  2. paste the token into the sidecar (desktop app) to connect'));
+    console.log(c.dim('  Setting up without a sidecar? Put "auth:\n  insecure_open_access: true"'));
+    console.log(c.dim(`  in ~/.jarvis/config.yaml, open http://localhost:${port ?? 3142}, and`));
+    console.log(c.dim('  REMOVE the flag once your device is enrolled.'));
     console.log('');
   }
 
@@ -123,9 +138,11 @@ async function cmdStart(args: string[]): Promise<void> {
       console.log(c.dim('  Stop it first with: jarvis stop'));
       process.exit(1);
     }
+    // Release the flock on final exit. Do NOT handle SIGINT/SIGTERM here: the
+    // daemon (src/daemon/index.ts) traps them and runs a bounded graceful
+    // DRAIN before exiting. A `process.exit(0)` from the CLI would preempt that
+    // async teardown mid-flight. The OS auto-releases the flock on exit anyway.
     process.on('exit', () => releaseLock());
-    process.on('SIGINT', () => { releaseLock(); process.exit(0); });
-    process.on('SIGTERM', () => { releaseLock(); process.exit(0); });
 
     const { startDaemon } = await import('../src/daemon/index.ts');
     await startDaemon({ port, dataDir, noLocalTools });
@@ -184,7 +201,11 @@ async function cmdStart(args: string[]): Promise<void> {
   }
 }
 
-async function cmdStop(args: string[] = []): Promise<void> {
+// Returns true when the daemon is stopped and its lock cleared; false when a
+// daemon still holds the lock (unsignalable, or relaunched by a supervisor).
+// Callers decide whether that is fatal — `jarvis restart` must not exit here.
+async function cmdStop(args: string[] = [], opts: { verb?: string } = {}): Promise<boolean> {
+  const verb = opts.verb ?? 'Stopping';
   const pid = isLocked();
 
   // Parse `--port N` for the no-lockfile recovery path. Ignored when the
@@ -202,11 +223,18 @@ async function cmdStop(args: string[] = []): Promise<void> {
 
   const resolution = resolveStopPort({ cliPort });
   const port = resolution.port;
-  if (resolution.source !== 'lockfile' && resolution.source !== 'default') {
+  if (port !== null && resolution.source !== 'lockfile' && resolution.source !== 'default') {
     console.log(c.dim(`  Using port ${port} (from ${resolution.source})`));
+  }
+  if (port === null) {
+    console.log(c.dim('  Unix-socket mode (daemon.listen) — pid-only stop, no port cleanup'));
   }
 
   if (!pid) {
+    if (port === null) {
+      console.log(c.yellow('JARVIS is not running.'));
+      return true;
+    }
     const cleanup = await ensurePortReleased(port);
     if (cleanup.terminated.length > 0 || cleanup.forced.length > 0) {
       const details = cleanup.forced.length > 0
@@ -216,30 +244,70 @@ async function cmdStop(args: string[] = []): Promise<void> {
     } else {
       console.log(c.yellow('JARVIS is not running.'));
     }
-    return;
+    return true;
   }
 
-  console.log(c.cyan(`Stopping JARVIS daemon (PID ${pid})...`));
+  console.log(c.cyan(`${verb} JARVIS daemon (PID ${pid})...`));
   try {
     process.kill(pid, 'SIGTERM');
 
-    // Wait up to 5s for graceful shutdown, then SIGKILL
+    // SIGTERM triggers a BOUNDED graceful drain in the daemon (finish in-flight
+    // turns/workflows within the deadline). Poll until it exits -- an idle
+    // daemon exits near-instantly; a busy one drains first. SIGKILL only if it
+    // overruns its own drain deadline (+ margin).
+    const cfg = await loadConfig().catch(() => null);
+    const graceMs = (cfg?.daemon?.drain_deadline_ms ?? 75_000) + 20_000;
+    const deadline = Date.now() + graceMs;
     let alive = true;
-    for (let i = 0; i < 10; i++) {
+    let ticks = 0;
+    while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 500));
-      try { process.kill(pid, 0); } catch { alive = false; break; }
+      if (!isProcessAlive(pid)) { alive = false; break; }
+      if (++ticks === 6) console.log(c.dim('  Draining in-flight work...'));
     }
 
     if (alive) {
-      console.log(c.dim('  Process still alive, sending SIGKILL...'));
+      console.log(c.dim('  Drain deadline exceeded, sending SIGKILL...'));
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      // SIGKILL returns before the kernel finishes the teardown.
+      await waitForProcessExit(pid, 2000);
     }
 
+    // releaseLock() unlinks the lockfile whether or not we hold it, so it may
+    // only run when nothing holds the flock. Probing the LOCK (rather than the
+    // pid we signalled) covers all three ways a daemon can still be there: it
+    // ignored/refused our signals (EPERM), or a service manager relaunched it
+    // under a new pid (launchd KeepAlive, systemd Restart). Unlinking in either
+    // case would let the next `jarvis start` take a fresh inode and run a
+    // second daemon against the same data dir.
+    // releaseLockIfUnheld() unlinks ONLY when nothing holds the flock, and does
+    // it while holding the lock itself — so a supervisor-spawned replacement
+    // (launchd KeepAlive, systemd Restart) can neither be mistaken for a dead
+    // daemon nor slip in between the check and the unlink.
+    if (!releaseLockIfUnheld()) {
+      const holder = isLocked();
+      const relaunched = holder !== null && holder !== pid;
+      console.error(c.red(
+        relaunched
+          ? `✗ JARVIS daemon (PID ${pid}) stopped, but a new one (PID ${holder}) is already running.`
+          : `✗ Could not stop JARVIS daemon (PID ${pid}) — it is still running.`,
+      ));
+      console.error(c.dim(
+        relaunched
+          ? '  A service manager restarted it. Remove autostart first: jarvis uninstall (or disable the service).'
+          : '  Its lockfile was left in place. Stop it as its owner, or with root.',
+      ));
+      return false;
+    }
+
+    if (port === null) {
+      console.log(c.green('✓ JARVIS daemon stopped.'));
+      return true;
+    }
     const cleanup = await ensurePortReleased(port);
-    releaseLock();
     if (!cleanup.released) {
       console.error(c.red(`✗ JARVIS stopped but port ${port} is still occupied.`));
-      process.exit(1);
+      return false;
     }
 
     const details = cleanup.forced.length > 0
@@ -248,9 +316,16 @@ async function cmdStop(args: string[] = []): Promise<void> {
         ? ` Cleaned up lingering listener(s) on port ${port}: ${cleanup.terminated.join(', ')}.`
         : '';
     console.log(c.green(`✓ JARVIS daemon stopped.${details}`));
+    return true;
   } catch (err) {
     console.error(c.red(`Failed to stop process ${pid}: ${err}`));
-    releaseLock();
+    // Same rule as the success path: clear the lock only when nothing holds it
+    // (SIGTERM raising ESRCH — a stale lockfile), never while a daemon is live.
+    if (!releaseLockIfUnheld()) {
+      console.error(c.dim('  A daemon still holds the lock; its lockfile was left in place.'));
+      return false;
+    }
+    return true;
   }
 }
 
@@ -287,7 +362,18 @@ async function cmdUninstall(): Promise<void> {
 async function cmdRestart(args: string[]): Promise<void> {
   const pid = isLocked();
   if (pid) {
-    await cmdStop();
+    if (!await cmdStop()) {
+      // Under launchd KeepAlive / systemd Restart the daemon comes straight
+      // back under a new pid. That IS the restart the user asked for — report
+      // it rather than exiting, and never fall through to cmdStart, which would
+      // only fail acquireLock() against the live replacement.
+      const holder = isLocked();
+      if (holder !== null && holder !== pid) {
+        console.log(c.green(`✓ JARVIS restarted by its service manager (PID ${holder}).`));
+        return;
+      }
+      process.exit(1);
+    }
   }
 
   console.log('');
@@ -308,7 +394,7 @@ function cmdLogs(args: string[]): void {
   let lines = 50;
   const nIdx = args.indexOf('-n') !== -1 ? args.indexOf('-n') : args.indexOf('--lines');
   if (nIdx !== -1 && args[nIdx + 1]) {
-    const n = parseInt(args[nIdx + 1], 10);
+    const n = parseInt(args[nIdx + 1]!, 10);
     if (!isNaN(n) && n > 0) lines = n;
   }
 
@@ -376,7 +462,11 @@ switch (command) {
     await cmdStart(commandArgs);
     break;
   case 'stop':
-    await cmdStop(commandArgs);
+    if (!await cmdStop(commandArgs)) process.exit(1);
+    break;
+  case 'drain':
+    // Same signal as stop (SIGTERM -> bounded graceful drain); clearer label.
+    if (!await cmdStop(commandArgs, { verb: 'Draining' })) process.exit(1);
     break;
   case 'restart':
     await cmdRestart(commandArgs);
@@ -402,6 +492,26 @@ switch (command) {
   case 'doctor':
     await cmdDoctor();
     break;
+  case 'enroll': {
+    const { cmdEnroll } = await import('../src/cli/devices.ts');
+    process.exit(await cmdEnroll(commandArgs));
+  }
+  case 'sidecars': {
+    const { cmdSidecars } = await import('../src/cli/devices.ts');
+    process.exit(await cmdSidecars(commandArgs));
+  }
+  case 'revoke': {
+    const { cmdRevoke } = await import('../src/cli/devices.ts');
+    process.exit(await cmdRevoke(commandArgs));
+  }
+  case 'export': {
+    const { cmdExport } = await import('../src/cli/backup.ts');
+    process.exit(await cmdExport(commandArgs));
+  }
+  case 'restore': {
+    const { cmdRestore } = await import('../src/cli/backup.ts');
+    process.exit(await cmdRestore(commandArgs));
+  }
   case 'uninstall':
     await cmdUninstall();
     break;

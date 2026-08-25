@@ -8,6 +8,7 @@ import {
   failJob,
   getJob,
   queueStats,
+  recoverOrphanedJobs,
 } from "../db/repos/job-queue";
 import { Worker } from "./worker";
 
@@ -35,6 +36,28 @@ describe("job-queue repo", () => {
 
     completeJob(j.id);
     expect(getJob(j.id)?.status).toBe("SUCCEEDED");
+  });
+
+  test("recoverOrphanedJobs re-queues orphaned RUNNING jobs for immediate re-claim", () => {
+    const j = enqueue({ jobType: "TEST", payload: {} });
+    const claimed = claimNextJob(); // -> RUNNING with a live (future) lease
+    expect(claimed?.id).toBe(j.id);
+    // A normal poll won't re-claim it: the lease hasn't lapsed.
+    expect(claimNextJob()).toBeNull();
+    // Boot recovery treats the orphaned RUNNING job as re-runnable NOW.
+    expect(recoverOrphanedJobs()).toBe(1);
+    expect(getJob(j.id)?.status).toBe("QUEUED");
+    expect(claimNextJob()?.id).toBe(j.id); // immediately re-claimable
+  });
+
+  test("recoverOrphanedJobs fails a poison job at the attempt ceiling instead of re-queuing", () => {
+    const poison = enqueue({ jobType: "T", payload: {}, maxAttempts: 1 });
+    claimNextJob(); // poison -> RUNNING, attempt 1 == max_attempts
+    const healthy = enqueue({ jobType: "T", payload: {}, maxAttempts: 3 });
+    claimNextJob(); // healthy -> RUNNING, attempt 1 < max_attempts
+    expect(recoverOrphanedJobs()).toBe(1); // only the healthy one re-queues
+    expect(getJob(poison.id)?.status).toBe("FAILED");
+    expect(getJob(healthy.id)?.status).toBe("QUEUED");
   });
 
   test("priority + scheduled_at ordering", () => {
@@ -76,7 +99,7 @@ describe("job-queue repo", () => {
 
   test("failJob retries with exponential backoff while attempts remain", () => {
     const now = Date.now();
-    const j = enqueue({ jobType: "T", payload: {}, maxAttempts: 3 });
+    const j = enqueue({ jobType: "T", payload: {}, maxAttempts: 3, scheduledAt: now });
     const c1 = claimNextJob({ now });
     expect(c1?.attempt).toBe(1);
 
@@ -94,7 +117,7 @@ describe("job-queue repo", () => {
 
   test("failJob terminates as FAILED after maxAttempts", () => {
     const now = Date.now();
-    const j = enqueue({ jobType: "T", payload: {}, maxAttempts: 2 });
+    const j = enqueue({ jobType: "T", payload: {}, maxAttempts: 2, scheduledAt: now });
     claimNextJob({ now });
     failJob(j.id, "first", { backoffMs: 1, now });
     claimNextJob({ now: now + 1 });

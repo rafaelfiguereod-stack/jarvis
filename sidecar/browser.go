@@ -1,164 +1,365 @@
 package main
 
 import (
-	"context"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"nhooyr.io/websocket"
 )
 
-// ── CDP Client ───────────────────────────────────────────────────────
+// ── CDP over an inherited pipe ────────────────────────────────────────
+//
+// Instead of opening a localhost debugging *port* (which any local process /
+// page could connect to), the sidecar launches the browser with
+// `--remote-debugging-pipe` and speaks the Chrome DevTools Protocol over a pair
+// of inherited file descriptors: the browser reads commands on fd 3 and writes
+// responses/events on fd 4. Messages are NUL-delimited JSON. Because the
+// connection is browser-level (not bound to one page), we attach to a page
+// target up front and tag page-scoped commands with its flat-mode sessionId.
+//
+// The OS-specific plumbing that wires fd 3/4 lives in startBrowserPipe
+// (browser_pipe_unix.go / browser_pipe_windows.go); everything below is shared.
 
-// cdpClient manages a Chrome DevTools Protocol connection.
+// browserProc is a launched browser whose CDP pipe we own.
+type browserProc struct {
+	write io.WriteCloser // commands we write  -> browser fd 3
+	read  io.ReadCloser  // responses we read  <- browser fd 4
+	kill  func()         // terminate the browser process
+}
+
+// cdpClient manages a Chrome DevTools Protocol connection over the pipe.
 type cdpClient struct {
-	mu      sync.Mutex
-	conn    *websocket.Conn
-	port    int
+	mu        sync.Mutex // serializes writes to the pipe
+	proc      *browserProc
+	sessionID string // flat-mode session for the attached page target
+	headless  bool   // visibility mode the browser was launched in
+
 	msgID   atomic.Int64
-	pending map[int64]chan json.RawMessage
+	pending map[int64]chan cdpReply
 	pendMu  sync.Mutex
+	closed  atomic.Bool
+
+	// Element centers from the last snapshot, keyed by 1-based element id.
+	// Click/hover resolve ids against THIS, not a fresh selector query, so a
+	// click lands where the snapshot said the element was.
+	elemMu     sync.Mutex
+	elemCoords map[int][2]float64
+
+	// One-shot waiters for CDP events (e.g. Page.loadEventFired).
+	eventMu      sync.Mutex
+	eventWaiters map[string][]chan struct{}
+}
+
+// waitForEvent returns a channel that closes when the named CDP event next
+// fires. Register BEFORE the action that triggers the event.
+func (c *cdpClient) waitForEvent(method string) <-chan struct{} {
+	ch := make(chan struct{})
+	c.eventMu.Lock()
+	if c.eventWaiters == nil {
+		c.eventWaiters = make(map[string][]chan struct{})
+	}
+	c.eventWaiters[method] = append(c.eventWaiters[method], ch)
+	c.eventMu.Unlock()
+	return ch
+}
+
+func (c *cdpClient) fireEvent(method string) {
+	c.eventMu.Lock()
+	waiters := c.eventWaiters[method]
+	delete(c.eventWaiters, method)
+	c.eventMu.Unlock()
+	for _, ch := range waiters {
+		close(ch)
+	}
+}
+
+type cdpReply struct {
+	result json.RawMessage
+	errMsg json.RawMessage
 }
 
 var activeCDP struct {
-	mu     sync.Mutex
-	client *cdpClient
-	port   int
+	mu      sync.Mutex
+	client  *cdpClient
+	healthy bool
 }
 
-func getCDP(cfg *SidecarConfig) (*cdpClient, error) {
+// getCDP returns the live browser CDP client, launching the browser lazily on
+// first use. A running browser is reused; but when the caller *explicitly*
+// requests the other visibility mode (explicit==true and headless differs), the
+// current browser is torn down and relaunched so the option takes effect. When
+// headless is not specified (explicit==false) the running browser is kept as-is
+// to avoid thrashing on every call.
+func getCDP(cfg *SidecarConfig, headless, explicit bool) (*cdpClient, error) {
 	activeCDP.mu.Lock()
 	defer activeCDP.mu.Unlock()
 
-	port := cfg.Browser.CDPPort
-	if port == 0 {
-		port = 9222
+	if c := activeCDP.client; c != nil && !c.closed.Load() {
+		if explicit && c.headless != headless {
+			activeCDP.client = nil
+			c.shutdown()
+		} else {
+			return c, nil
+		}
 	}
 
-	if activeCDP.client != nil && activeCDP.port == port {
-		return activeCDP.client, nil
+	client, err := launchCDP(cfg, headless)
+	if err != nil {
+		return nil, err
 	}
+	activeCDP.client = client
+	return client, nil
+}
 
-	client, err := newCDPClient(port)
+// browserProfileName derives a per-browser user-data dir name from the
+// executable, e.g. chrome.exe -> "jarvis-chrome-profile",
+// msedge.exe -> "jarvis-msedge-profile".
+func browserProfileName(exe string) string {
+	base := strings.ToLower(filepath.Base(exe))
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	base = strings.ReplaceAll(base, " ", "-")
+	if base == "" {
+		base = "chromium"
+	}
+	return "jarvis-" + base + "-profile"
+}
+
+// chromiumLaunchArgs builds the command-line flags for the automation browser.
+func chromiumLaunchArgs(profileDir string, headless bool) []string {
+	args := []string{
+		"--remote-debugging-pipe",
+		"--user-data-dir=" + profileDir,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-features=Translate",
+	}
+	if headless {
+		args = append(args, "--headless=new", "--hide-scrollbars")
+	}
+	args = append(args, "about:blank")
+	return args
+}
+
+// browserReadyTimeout bounds how long a freshly-spawned browser may take to
+// start answering CDP at all. Generous on purpose: it is a ceiling for a cold
+// start on a throttled CI runner, not a latency budget -- waitForBrowserReady
+// returns as soon as the browser replies.
+const browserReadyTimeout = 30 * time.Second
+
+// launchCDP finds a Chromium-based browser, starts it with the CDP pipe, and
+// attaches to a page target.
+func launchCDP(cfg *SidecarConfig, headless bool) (*cdpClient, error) {
+	exe, err := findChromiumExecutable(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	activeCDP.client = client
-	activeCDP.port = port
-	return client, nil
-}
+	profileDir := cfg.Browser.ProfileDir
+	if profileDir == "" {
+		// Per-browser profile dir: a profile created by Chrome can't be reused by
+		// Edge/Brave (Chromium refuses a profile from a different brand with a
+		// "can't use this profile" alert), so key it on the executable.
+		profileDir = filepath.Join(os.TempDir(), browserProfileName(exe))
+	}
 
-func newCDPClient(port int) (*cdpClient, error) {
-	// Get the first page's WebSocket URL from Chrome's /json endpoint
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	url := fmt.Sprintf("http://localhost:%d/json", port)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := http.DefaultClient.Do(req)
+	proc, err := startBrowserPipe(exe, chromiumLaunchArgs(profileDir, headless))
 	if err != nil {
-		return nil, fmt.Errorf("Chrome not running on port %d — launch Chrome with --remote-debugging-port=%d: %w", port, port, err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var targets []struct {
-		WebSocketDebuggerUrl string `json:"webSocketDebuggerUrl"`
-		Type                 string `json:"type"`
-	}
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return nil, fmt.Errorf("parse CDP targets: %w", err)
+		return nil, fmt.Errorf("launch browser %q: %w", exe, err)
 	}
 
-	wsURL := ""
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerUrl != "" {
-			wsURL = t.WebSocketDebuggerUrl
-			break
-		}
+	mode := "headed"
+	if headless {
+		mode = "headless"
 	}
-	if wsURL == "" {
-		return nil, fmt.Errorf("no CDP page target found on port %d", port)
-	}
-
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("CDP WebSocket dial: %w", err)
-	}
-	conn.SetReadLimit(50 * 1024 * 1024)
+	log.Printf("[browser] launched %s (%s) with CDP pipe", filepath.Base(exe), mode)
 
 	c := &cdpClient{
-		conn:    conn,
-		port:    port,
-		pending: make(map[int64]chan json.RawMessage),
+		proc:     proc,
+		headless: headless,
+		pending:  make(map[int64]chan cdpReply),
+	}
+	go c.readLoop(proc.read)
+
+	// Wait for the process to actually be answering CDP before asking it for
+	// anything, so a slow start reads as "still booting" rather than as a
+	// timed-out Target.getTargets.
+	if err := c.waitForBrowserReady(browserReadyTimeout); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("launch browser %q: %w", exe, err)
 	}
 
-	// Start read loop
-	go c.readLoop()
+	if err := c.attachToPage(); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("attach to page: %w", err)
+	}
+
+	// Enable Page events so navigate can wait for Page.loadEventFired.
+	// Non-fatal: navigation falls back to a fixed settle delay without it.
+	if _, err := c.send("Page.enable", nil); err != nil {
+		log.Printf("[browser] Page.enable failed (navigation uses fixed delay): %v", err)
+	}
 
 	return c, nil
 }
 
-func (c *cdpClient) readLoop() {
+// attachToPage finds (or creates) a page target and stores its flat session id.
+func (c *cdpClient) attachToPage() error {
+	targetID := ""
+	// The about:blank window the browser opens at launch may not register as a
+	// target for a beat; poll briefly before falling back to creating one.
+	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, data, err := c.conn.Read(context.Background())
+		raw, err := c.sendOn("", "Target.getTargets", nil)
 		if err != nil {
-			c.close()
-			return
+			return err
 		}
-		var msg struct {
-			ID     int64           `json:"id"`
-			Result json.RawMessage `json:"result"`
-			Error  json.RawMessage `json:"error"`
+		var res struct {
+			TargetInfos []struct {
+				TargetID string `json:"targetId"`
+				Type     string `json:"type"`
+			} `json:"targetInfos"`
 		}
-		if json.Unmarshal(data, &msg) != nil {
-			continue
-		}
-		if msg.ID == 0 {
-			continue // event, ignore
-		}
-
-		c.pendMu.Lock()
-		ch, ok := c.pending[msg.ID]
-		if ok {
-			delete(c.pending, msg.ID)
-		}
-		c.pendMu.Unlock()
-
-		if ok {
-			if msg.Error != nil {
-				ch <- msg.Error
-			} else {
-				ch <- msg.Result
+		json.Unmarshal(raw, &res)
+		for _, t := range res.TargetInfos {
+			if t.Type == "page" {
+				targetID = t.TargetID
+				break
 			}
+		}
+		if targetID != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if targetID == "" {
+		raw, err := c.sendOn("", "Target.createTarget", map[string]any{"url": "about:blank"})
+		if err != nil {
+			return err
+		}
+		var res struct {
+			TargetID string `json:"targetId"`
+		}
+		json.Unmarshal(raw, &res)
+		targetID = res.TargetID
+	}
+	if targetID == "" {
+		return fmt.Errorf("no page target available")
+	}
+
+	raw, err := c.sendOn("", "Target.attachToTarget", map[string]any{
+		"targetId": targetID,
+		"flatten":  true,
+	})
+	if err != nil {
+		return err
+	}
+	var att struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.Unmarshal(raw, &att)
+	if att.SessionID == "" {
+		return fmt.Errorf("attach returned no sessionId")
+	}
+	c.sessionID = att.SessionID
+	return nil
+}
+
+// readLoop consumes NUL-delimited CDP messages and routes replies by id.
+func (c *cdpClient) readLoop(r io.Reader) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		data, err := br.ReadBytes(0)
+		if len(data) > 1 {
+			if n := len(data); data[n-1] == 0 {
+				data = data[:n-1]
+			}
+			var msg struct {
+				ID     int64           `json:"id"`
+				Method string          `json:"method"`
+				Result json.RawMessage `json:"result"`
+				Error  json.RawMessage `json:"error"`
+			}
+			if json.Unmarshal(data, &msg) == nil {
+				if msg.ID != 0 {
+					c.pendMu.Lock()
+					ch, ok := c.pending[msg.ID]
+					if ok {
+						delete(c.pending, msg.ID)
+					}
+					c.pendMu.Unlock()
+					if ok {
+						ch <- cdpReply{result: msg.Result, errMsg: msg.Error}
+					}
+				} else if msg.Method != "" {
+					// Protocol event — wake anyone waiting on it.
+					c.fireEvent(msg.Method)
+				}
+			}
+		}
+		if err != nil {
+			c.fail()
+			return
 		}
 	}
 }
 
+// send issues a page-scoped command (tagged with the attached sessionId).
 func (c *cdpClient) send(method string, params map[string]any) (json.RawMessage, error) {
-	id := c.msgID.Add(1)
-	ch := make(chan json.RawMessage, 1)
+	return c.sendOn(c.sessionID, method, params)
+}
 
+// cdpDefaultTimeout bounds a single CDP round-trip once the browser is known
+// to be answering. The launch handshake uses a shorter, retried budget instead
+// -- see waitForBrowserReady.
+const cdpDefaultTimeout = 30 * time.Second
+
+// errCDPTimeout marks a command that got no reply inside its budget. It is the
+// one failure worth retrying: the browser may simply not be listening yet. A
+// transport error means the pipe is gone and no retry can help, so callers that
+// poll must tell the two apart.
+var errCDPTimeout = errors.New("CDP timeout")
+
+// sendOn issues a command on a specific session ("" = browser-level).
+func (c *cdpClient) sendOn(sessionID, method string, params map[string]any) (json.RawMessage, error) {
+	return c.sendOnTimeout(sessionID, method, params, cdpDefaultTimeout)
+}
+
+// sendOnTimeout is sendOn with an explicit reply deadline.
+func (c *cdpClient) sendOnTimeout(sessionID, method string, params map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	if c.closed.Load() {
+		return nil, fmt.Errorf("browser connection closed")
+	}
+
+	id := c.msgID.Add(1)
+	ch := make(chan cdpReply, 1)
 	c.pendMu.Lock()
 	c.pending[id] = ch
 	c.pendMu.Unlock()
 
-	msg := map[string]any{
-		"id":     id,
-		"method": method,
-		"params": params,
+	msg := map[string]any{"id": id, "method": method}
+	if params != nil {
+		msg["params"] = params
 	}
-
+	if sessionID != "" {
+		msg["sessionId"] = sessionID
+	}
 	data, _ := json.Marshal(msg)
+	data = append(data, 0) // NUL terminator
+
 	c.mu.Lock()
-	err := c.conn.Write(context.Background(), websocket.MessageText, data)
+	_, err := c.proc.write.Write(data)
 	c.mu.Unlock()
 	if err != nil {
 		c.pendMu.Lock()
@@ -168,23 +369,116 @@ func (c *cdpClient) send(method string, params map[string]any) (json.RawMessage,
 	}
 
 	select {
-	case result := <-ch:
-		return result, nil
-	case <-time.After(30 * time.Second):
+	case reply := <-ch:
+		if reply.errMsg != nil {
+			return nil, fmt.Errorf("CDP %s: %s", method, string(reply.errMsg))
+		}
+		return reply.result, nil
+	case <-time.After(timeout):
 		c.pendMu.Lock()
 		delete(c.pending, id)
 		c.pendMu.Unlock()
-		return nil, fmt.Errorf("CDP timeout for %s", method)
+		return nil, fmt.Errorf("%w for %s", errCDPTimeout, method)
 	}
 }
 
-func (c *cdpClient) close() {
+// waitForBrowserReady blocks until the freshly-spawned browser answers a
+// browser-level CDP command, or the deadline passes.
+//
+// A cold Chromium on a loaded machine can take many seconds before it reads the
+// CDP pipe at all. Firing the first real command straight at it spends the full
+// 30s round-trip budget on a browser that simply had not started yet, then fails
+// the whole launch -- the "attach to page: CDP timeout for Target.getTargets"
+// flake seen on CI runners. Polling with a short per-attempt budget instead
+// turns that into a wait: each probe that finds nobody home is retried rather
+// than consuming the entire allowance.
+func (c *cdpClient) waitForBrowserReady(budget time.Duration) error {
+	const probeTimeout = 2 * time.Second
+
+	stop := time.Now().Add(budget)
+	var lastErr error
+	for {
+		// Belt and braces. In practice this cannot fire mid-launch: the only
+		// paths that set closed (readLoop's fail(), closeActiveCDP) take
+		// activeCDP.mu first, and getCDP holds it for the whole launch. A dead
+		// browser reaches us as the write error handled just below.
+		if c.closed.Load() {
+			return errors.New("browser connection closed before it became ready")
+		}
+
+		_, err := c.sendOnTimeout("", "Browser.getVersion", nil, probeTimeout)
+		if err == nil {
+			return nil
+		}
+		// Only a timeout means "not up yet". Anything else is a transport
+		// failure -- the browser died at startup and the pipe is broken -- and
+		// retrying it would trade an instant, accurate error for a 30s stall.
+		if !errors.Is(err, errCDPTimeout) {
+			return fmt.Errorf("browser died during startup: %w", err)
+		}
+		lastErr = err
+
+		if time.Now().After(stop) {
+			return fmt.Errorf("browser did not answer CDP within %s: %w", budget, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// shutdown tears down the connection and the browser process. Idempotent. Does
+// NOT touch activeCDP, so it is safe to call while holding activeCDP.mu.
+func (c *cdpClient) shutdown() {
+	if c.closed.Swap(true) {
+		return
+	}
+	if c.proc != nil {
+		c.proc.write.Close()
+		c.proc.read.Close()
+		if c.proc.kill != nil {
+			c.proc.kill()
+		}
+	}
+}
+
+// fail is invoked when the pipe dies: it clears the cached client (so the next
+// browser tool call relaunches) and shuts the connection down.
+func (c *cdpClient) fail() {
 	activeCDP.mu.Lock()
 	if activeCDP.client == c {
 		activeCDP.client = nil
 	}
 	activeCDP.mu.Unlock()
-	c.conn.Close(websocket.StatusNormalClosure, "closing")
+	c.shutdown()
+}
+
+// closeActiveCDP closes the current browser (if any) and clears the cache so the
+// next browser tool call starts fresh — e.g. to switch visibility modes.
+func closeActiveCDP() {
+	activeCDP.mu.Lock()
+	c := activeCDP.client
+	activeCDP.client = nil
+	activeCDP.mu.Unlock()
+	if c != nil {
+		c.shutdown()
+	}
+}
+
+// headlessParam reads the optional headless flag from RPC params. explicit
+// reports whether the caller actually supplied it (vs. defaulting). Default
+// false -> the browser opens headed so the user can see and interact with it.
+func headlessParam(params map[string]any) (value bool, explicit bool) {
+	v, ok := params["headless"]
+	if !ok {
+		return false, false
+	}
+	b, _ := v.(bool)
+	return b, true
+}
+
+// getCDPForParams launches/reuses the browser honoring the call's headless flag.
+func getCDPForParams(cfg *SidecarConfig, params map[string]any) (*cdpClient, error) {
+	headless, explicit := headlessParam(params)
+	return getCDP(cfg, headless, explicit)
 }
 
 // ── Browser Handlers ─────────────────────────────────────────────────
@@ -196,44 +490,49 @@ func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("missing required parameter: url")
 		}
 
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
 
-		result, err := cdp.send("Page.navigate", map[string]any{"url": url})
-		if err != nil {
+		// Register the waiter BEFORE navigating so the event can't be missed
+		loaded := cdp.waitForEvent("Page.loadEventFired")
+
+		if _, err := cdp.send("Page.navigate", map[string]any{"url": url}); err != nil {
 			return nil, fmt.Errorf("navigate failed: %w", err)
 		}
 
-		// Wait for page load
-		time.Sleep(1 * time.Second)
+		select {
+		case <-loaded:
+		case <-time.After(30 * time.Second):
+			// Page may still be usable (SPAs, slow loads) — same fallback as
+			// the daemon's local navigate.
+			log.Printf("[browser] page load timeout for %s, continuing anyway", url)
+		}
 
-		// Get page content
-		snapshot, _ := getBrowserSnapshot(cdp)
+		// Let JS settle (matches the daemon's post-load delay)
+		time.Sleep(800 * time.Millisecond)
 
-		return &RPCResult{Result: map[string]any{
-			"success":  true,
-			"url":      url,
-			"navigate": json.RawMessage(result),
-			"snapshot": snapshot,
-		}}, nil
+		formatted, err := takeFormattedSnapshot(cdp)
+		if err != nil {
+			return nil, err
+		}
+		return &RPCResult{Result: formatted}, nil
 	}
 }
 
 func makeBrowserSnapshotHandler(cfg *SidecarConfig) RPCHandler {
 	return func(params map[string]any) (*RPCResult, error) {
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
 
-		snapshot, err := getBrowserSnapshot(cdp)
+		formatted, err := takeFormattedSnapshot(cdp)
 		if err != nil {
 			return nil, err
 		}
-
-		return &RPCResult{Result: snapshot}, nil
+		return &RPCResult{Result: formatted}, nil
 	}
 }
 
@@ -243,32 +542,37 @@ func makeBrowserClickHandler(cfg *SidecarConfig) RPCHandler {
 		if !ok {
 			return nil, fmt.Errorf("missing required parameter: element_id")
 		}
+		button, _ := params["button"].(string)
+		if button != "right" {
+			button = "left"
+		}
+		double, _ := params["double"].(bool)
 
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
 
-		// Use JavaScript to find and click element by index
-		script := fmt.Sprintf(`
-(function() {
-    var els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
-    var el = els[%d];
-    if (!el) return JSON.stringify({error: "Element not found", id: %d});
-    el.click();
-    return JSON.stringify({success: true, tag: el.tagName, id: %d});
-})()
-`, int(elemID), int(elemID), int(elemID))
+		id := int(elemID)
+		coords, found := cdp.elementCoordsFor(id)
+		if !found {
+			return &RPCResult{Result: fmt.Sprintf("Error: Element [%d] not found. Run browser_snapshot first.", id)}, nil
+		}
 
-		result, err := cdp.send("Runtime.evaluate", map[string]any{
-			"expression":    script,
-			"returnByValue": true,
-		})
-		if err != nil {
+		if err := dispatchClick(cdp, coords[0], coords[1], button, double); err != nil {
 			return nil, fmt.Errorf("click failed: %w", err)
 		}
 
-		return &RPCResult{Result: map[string]any{"result": json.RawMessage(result)}}, nil
+		// Wait for navigation/changes (matches the daemon's local click)
+		time.Sleep(1 * time.Second)
+
+		kind := "Clicked"
+		if double {
+			kind = "Double-clicked"
+		} else if button == "right" {
+			kind = "Right-clicked"
+		}
+		return &RPCResult{Result: fmt.Sprintf("%s element [%d]", kind, id)}, nil
 	}
 }
 
@@ -279,67 +583,134 @@ func makeBrowserTypeHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("missing required parameter: text")
 		}
 		elemID, hasElem := params["element_id"].(float64)
+		if !hasElem {
+			return nil, fmt.Errorf("missing required parameter: element_id")
+		}
 		submit, _ := params["submit"].(bool)
+		appendMode, _ := params["append"].(bool)
 
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
 
-		if hasElem {
-			// Focus and set value on element
-			script := fmt.Sprintf(`
-(function() {
-    var els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
-    var el = els[%d];
-    if (!el) return JSON.stringify({error: "Element not found"});
-    el.focus();
-    el.value = %s;
-    el.dispatchEvent(new Event('input', {bubbles: true}));
-    el.dispatchEvent(new Event('change', {bubbles: true}));
-    return JSON.stringify({success: true, tag: el.tagName});
-})()
-`, int(elemID), jsonString(text))
-			cdp.send("Runtime.evaluate", map[string]any{
-				"expression":    script,
-				"returnByValue": true,
-			})
-		} else {
-			// Type into focused element character by character
-			for _, ch := range text {
-				cdp.send("Input.dispatchKeyEvent", map[string]any{
-					"type": "keyDown",
-					"text": string(ch),
-				})
-				cdp.send("Input.dispatchKeyEvent", map[string]any{
-					"type": "keyUp",
-					"text": string(ch),
-				})
-			}
+		id := int(elemID)
+		coords, found := cdp.elementCoordsFor(id)
+		if !found {
+			return &RPCResult{Result: fmt.Sprintf("Error: Element [%d] not found. Run browser_snapshot first.", id)}, nil
 		}
+
+		// Focus via the DOM refs the snapshot stored, and clear or position the
+		// caret — same script as the daemon's local type (session.ts).
+		appendJS := "false"
+		if appendMode {
+			appendJS = "true"
+		}
+		script := fmt.Sprintf(`(() => {
+        const el = window.__jarvis_elements && window.__jarvis_elements[%d];
+        if (!el) return 'not_found';
+        el.focus();
+        const append = %s;
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+          if (append) {
+            try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
+          } else {
+            el.value = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        } else if (el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
+          const doc = el.ownerDocument || document;
+          const win = doc.defaultView || window;
+          const range = doc.createRange();
+          range.selectNodeContents(el);
+          const sel = win.getSelection();
+          sel.removeAllRanges();
+          if (append) {
+            range.collapse(false);
+            sel.addRange(range);
+          } else {
+            sel.addRange(range);
+            doc.execCommand('delete', false, null);
+          }
+        }
+        return 'ok';
+      })()`, id-1, appendJS)
+
+		focusResult, err := cdp.send("Runtime.evaluate", map[string]any{
+			"expression":    script,
+			"returnByValue": true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("type into element failed: %w", err)
+		}
+		var focusParsed struct {
+			Result struct {
+				Value string `json:"value"`
+			} `json:"result"`
+		}
+		json.Unmarshal(focusResult, &focusParsed)
+
+		if focusParsed.Result.Value == "not_found" {
+			// Element refs lost (navigation happened) — coordinate-click
+			// fallback + Ctrl+A clearing, same as the daemon.
+			if err := dispatchClick(cdp, coords[0], coords[1], "left", false); err != nil {
+				return nil, fmt.Errorf("type focus fallback failed: %w", err)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if !appendMode {
+				for _, evType := range []string{"keyDown", "keyUp"} {
+					if _, err := cdp.send("Input.dispatchKeyEvent", map[string]any{
+						"type": evType, "key": "a", "code": "KeyA",
+						"windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65, "modifiers": 2,
+					}); err != nil {
+						return nil, fmt.Errorf("type clear fallback failed: %w", err)
+					}
+				}
+			}
+		} else {
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		// Insert text (paste-like — same as the daemon's Input.insertText)
+		if _, err := cdp.send("Input.insertText", map[string]any{"text": text}); err != nil {
+			return nil, fmt.Errorf("type failed: %w", err)
+		}
+
+		verb := "Typed"
+		if appendMode {
+			verb = "Appended"
+		}
+		result := fmt.Sprintf("%s %q into element [%d]", verb, text, id)
 
 		if submit {
-			cdp.send("Input.dispatchKeyEvent", map[string]any{
-				"type":                  "keyDown",
-				"key":                   "Enter",
-				"code":                  "Enter",
-				"windowsVirtualKeyCode": 13,
-			})
-			cdp.send("Input.dispatchKeyEvent", map[string]any{
-				"type":                  "keyUp",
-				"key":                   "Enter",
-				"code":                  "Enter",
-				"windowsVirtualKeyCode": 13,
-			})
+			time.Sleep(100 * time.Millisecond)
+			if err := pressEnter(cdp); err != nil {
+				return nil, fmt.Errorf("submit failed: %w", err)
+			}
+			time.Sleep(2 * time.Second)
+			result += " and pressed Enter"
 		}
 
-		return &RPCResult{Result: map[string]any{"success": true}}, nil
+		return &RPCResult{Result: result}, nil
 	}
+}
+
+// pressEnter matches the daemon's Enter sequence (rawKeyDown + char + keyUp).
+func pressEnter(cdp *cdpClient) error {
+	for _, evType := range []string{"rawKeyDown", "char", "keyUp"} {
+		if _, err := cdp.send("Input.dispatchKeyEvent", map[string]any{
+			"type": evType, "key": "Enter", "code": "Enter",
+			"windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func makeBrowserScreenshotHandler(cfg *SidecarConfig) RPCHandler {
 	return func(params map[string]any) (*RPCResult, error) {
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
@@ -362,47 +733,63 @@ func makeBrowserScreenshotHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("decode screenshot: %w", err)
 		}
 
-		_ = decoded // decoded bytes available if needed later
-
 		return &RPCResult{
-			Result: map[string]any{"captured": true},
-			Binary: &BinaryDataInline{
-				Type:     "inline",
-				MimeType: "image/png",
-				Data:     ss.Data,
-			},
+			Result:     map[string]any{"captured": true},
+			BinaryRaw:  decoded,
+			BinaryMime: "image/png",
 		}, nil
 	}
 }
 
 func makeBrowserScrollHandler(cfg *SidecarConfig) RPCHandler {
 	return func(params map[string]any) (*RPCResult, error) {
-		direction, _ := params["direction"].(string)
-		amount, _ := params["amount"].(float64)
-		if amount == 0 {
-			amount = 3
+		direction := "down"
+		if d, _ := params["direction"].(string); d == "up" {
+			direction = "up"
 		}
+		amount, hasAmount := params["amount"].(float64)
 
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
 
-		pixels := int(amount * 100)
+		// amount is PIXELS, defaulting to one viewport height — the same
+		// contract as the daemon's local scroll (the old sidecar treated
+		// amount as "screens", silently scrolling 100x less than asked).
+		scrollAmount := amount
+		if !hasAmount || scrollAmount == 0 {
+			scrollAmount = 600
+			if raw, err := cdp.send("Runtime.evaluate", map[string]any{
+				"expression":    "window.innerHeight",
+				"returnByValue": true,
+			}); err == nil {
+				var parsed struct {
+					Result struct {
+						Value float64 `json:"value"`
+					} `json:"result"`
+				}
+				if json.Unmarshal(raw, &parsed) == nil && parsed.Result.Value > 0 {
+					scrollAmount = parsed.Result.Value
+				}
+			}
+		}
+
+		pixels := int(scrollAmount)
 		if direction == "up" {
 			pixels = -pixels
 		}
 
-		script := fmt.Sprintf("window.scrollBy(0, %d)", pixels)
-		cdp.send("Runtime.evaluate", map[string]any{
-			"expression": script,
-		})
+		if _, err := cdp.send("Runtime.evaluate", map[string]any{
+			"expression": fmt.Sprintf("window.scrollBy(0, %d)", pixels),
+		}); err != nil {
+			return nil, fmt.Errorf("scroll failed: %w", err)
+		}
 
-		return &RPCResult{Result: map[string]any{
-			"success":   true,
-			"direction": direction,
-			"pixels":    pixels,
-		}}, nil
+		// Wait for lazy-loaded content (matches the daemon)
+		time.Sleep(500 * time.Millisecond)
+
+		return &RPCResult{Result: fmt.Sprintf("Scrolled %s by %dpx", direction, int(scrollAmount))}, nil
 	}
 }
 
@@ -413,7 +800,7 @@ func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("missing required parameter: expression")
 		}
 
-		cdp, err := getCDP(cfg)
+		cdp, err := getCDPForParams(cfg, params)
 		if err != nil {
 			return nil, err
 		}
@@ -421,86 +808,48 @@ func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
 		result, err := cdp.send("Runtime.evaluate", map[string]any{
 			"expression":    expression,
 			"returnByValue": true,
+			"awaitPromise":  true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("evaluate failed: %w", err)
 		}
 
-		return &RPCResult{Result: map[string]any{"result": json.RawMessage(result)}}, nil
+		// Unwrap to the same shape the daemon's evaluate tool returns:
+		// "(no return value)", the raw string, or pretty-printed JSON.
+		var parsed struct {
+			Result struct {
+				Value json.RawMessage `json:"value"`
+			} `json:"result"`
+			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
+		}
+		if err := json.Unmarshal(result, &parsed); err != nil {
+			return nil, fmt.Errorf("evaluate: parse reply: %w", err)
+		}
+		if parsed.ExceptionDetails != nil {
+			return nil, fmt.Errorf("JS error: %s", string(parsed.ExceptionDetails))
+		}
+		if parsed.Result.Value == nil || string(parsed.Result.Value) == "null" {
+			return &RPCResult{Result: "(no return value)"}, nil
+		}
+		var asString string
+		if json.Unmarshal(parsed.Result.Value, &asString) == nil {
+			return &RPCResult{Result: asString}, nil
+		}
+		var pretty any
+		if json.Unmarshal(parsed.Result.Value, &pretty) == nil {
+			if out, err := json.MarshalIndent(pretty, "", "  "); err == nil {
+				return &RPCResult{Result: string(out)}, nil
+			}
+		}
+		return &RPCResult{Result: string(parsed.Result.Value)}, nil
 	}
 }
 
-// ── Browser Snapshot Helper ──────────────────────────────────────────
-
-func getBrowserSnapshot(cdp *cdpClient) (map[string]any, error) {
-	// Get page URL and title
-	urlResult, _ := cdp.send("Runtime.evaluate", map[string]any{
-		"expression":    "JSON.stringify({url: location.href, title: document.title})",
-		"returnByValue": true,
-	})
-
-	var urlInfo struct {
-		Result struct {
-			Value string `json:"value"`
-		} `json:"result"`
+func makeBrowserCloseHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		closeActiveCDP()
+		return &RPCResult{Result: map[string]any{"closed": true}}, nil
 	}
-	json.Unmarshal(urlResult, &urlInfo)
-
-	var pageInfo map[string]string
-	json.Unmarshal([]byte(urlInfo.Result.Value), &pageInfo)
-
-	// Get text content and interactive elements
-	script := `
-(function() {
-    var text = document.body ? document.body.innerText.substring(0, 5000) : '';
-    var els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick], [tabindex]');
-    var items = [];
-    for (var i = 0; i < els.length && i < 200; i++) {
-        var el = els[i];
-        var r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) continue;
-        var item = {
-            id: i,
-            tag: el.tagName.toLowerCase(),
-            text: (el.textContent || el.value || el.placeholder || el.alt || '').substring(0, 100).trim(),
-            type: el.type || '',
-            href: el.href || '',
-            name: el.name || '',
-            role: el.getAttribute('role') || ''
-        };
-        items.push(item);
-    }
-    return JSON.stringify({text: text, elements: items, element_count: items.length});
-})()
-`
-
-	contentResult, err := cdp.send("Runtime.evaluate", map[string]any{
-		"expression":    script,
-		"returnByValue": true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var contentParsed struct {
-		Result struct {
-			Value string `json:"value"`
-		} `json:"result"`
-	}
-	json.Unmarshal(contentResult, &contentParsed)
-
-	var content map[string]any
-	json.Unmarshal([]byte(contentParsed.Result.Value), &content)
-
-	if content == nil {
-		content = map[string]any{}
-	}
-	if pageInfo != nil {
-		content["url"] = pageInfo["url"]
-		content["title"] = pageInfo["title"]
-	}
-
-	return content, nil
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

@@ -1,5 +1,118 @@
 import { describe, expect, test } from "bun:test";
-import { extractNestedMessage, formatProviderErrorMessage } from "./useWebSocket.ts";
+import { extractNestedMessage, finalizeStreamMessage, formatProviderErrorMessage, mergeRestoredHistory, nextStreamBuffer } from "./useWebSocket.ts";
+
+describe("finalizeStreamMessage", () => {
+  test("recovers text from the done frame when every stream chunk was missed", () => {
+    const messages = finalizeStreamMessage([], {
+      id: "assistant:req-1",
+      fullText: "This was spoken aloud.",
+      timestamp: 123,
+      toolCalls: [],
+      subAgentEvents: [],
+    });
+    expect(messages).toEqual([{
+      id: "assistant:req-1",
+      role: "assistant",
+      content: "This was spoken aloud.",
+      timestamp: 123,
+      isStreaming: false,
+    }]);
+  });
+
+  test("repairs partial streamed text with authoritative completed text", () => {
+    const messages = finalizeStreamMessage([{
+      id: "assistant:req-1", role: "assistant", content: "This was", timestamp: 100, isStreaming: true,
+    }], {
+      id: "assistant:req-1",
+      fullText: "This was spoken aloud.",
+      timestamp: 123,
+      toolCalls: [],
+      subAgentEvents: [],
+    });
+    expect(messages[0]?.content).toBe("This was spoken aloud.");
+    expect(messages[0]?.isStreaming).toBe(false);
+  });
+
+  test("does not duplicate a response when completion is handled twice", () => {
+    const existing = [{
+      id: "assistant:req-1", role: "assistant" as const, content: "OK", timestamp: 100, isStreaming: false,
+    }];
+    expect(finalizeStreamMessage(existing, {
+      id: "assistant:req-1", fullText: "OK", timestamp: 123, toolCalls: [], subAgentEvents: [],
+    })).toHaveLength(1);
+  });
+});
+
+describe("mergeRestoredHistory", () => {
+  const restored = [
+    { id: "vault-1", role: "user" as const, content: "hello", timestamp: 1 },
+    { id: "vault-2", role: "assistant" as const, content: "hi there", timestamp: 2 },
+  ];
+
+  test("returns history untouched when nothing raced in", () => {
+    expect(mergeRestoredHistory(restored, [])).toEqual(restored);
+  });
+
+  test("keeps a message that landed while the history fetch was in flight", () => {
+    const live = [{
+      id: "assistant:req-1", role: "assistant" as const, content: "recovered", timestamp: 3,
+    }];
+    expect(mergeRestoredHistory(restored, live)).toEqual([...restored, ...live]);
+  });
+
+  test("drops the live copy of a message the vault already has", () => {
+    const live = [{
+      id: "assistant:req-1", role: "assistant" as const, content: "hi there ", timestamp: 3,
+    }];
+    expect(mergeRestoredHistory(restored, live)).toEqual(restored);
+  });
+
+  test("does not collapse a genuinely repeated answer", () => {
+    const twice = [
+      ...restored,
+      { id: "vault-3", role: "assistant" as const, content: "hi there", timestamp: 3 },
+    ];
+    const live = [
+      { id: "a", role: "assistant" as const, content: "hi there", timestamp: 4 },
+      { id: "b", role: "assistant" as const, content: "hi there", timestamp: 5 },
+      { id: "c", role: "assistant" as const, content: "hi there", timestamp: 6 },
+    ];
+    // Two vault copies absorb two live copies; the third survives.
+    expect(mergeRestoredHistory(twice, live)).toHaveLength(4);
+  });
+
+  test("does not match across roles", () => {
+    const live = [{ id: "x", role: "user" as const, content: "hi there", timestamp: 3 }];
+    expect(mergeRestoredHistory(restored, live)).toHaveLength(3);
+  });
+});
+
+describe("nextStreamBuffer", () => {
+  test("adopts the relay's running total so a late client is not left truncated", () => {
+    // First chunk this client sees; everything before it was broadcast while
+    // the socket was still connecting.
+    expect(nextStreamBuffer("", { text: " world", accumulated: "hello world" }))
+      .toBe("hello world");
+  });
+
+  test("stays in step with local accumulation on a healthy stream", () => {
+    expect(nextStreamBuffer("hello", { text: " world", accumulated: "hello world" }))
+      .toBe("hello world");
+  });
+
+  test("falls back to appending when the chunk carries no accumulated total", () => {
+    expect(nextStreamBuffer("hello", { text: " world" })).toBe("hello world");
+  });
+
+  test("ignores a non-string accumulated value", () => {
+    expect(nextStreamBuffer("hello", { text: " world", accumulated: 42 }))
+      .toBe("hello world");
+  });
+
+  test("keeps the buffer intact when a chunk has no text at all", () => {
+    expect(nextStreamBuffer("hello", {})).toBe("hello");
+  });
+});
 
 describe("extractNestedMessage", () => {
   test("returns null for non-objects and empty values", () => {
@@ -30,6 +143,22 @@ describe("formatProviderErrorMessage — buckets", () => {
   test("auth: 401 status code", () => {
     const r = formatProviderErrorMessage("OpenAI API error (401): invalid_api_key");
     expect(r.summary).toContain("API key");
+  });
+
+  test("forbidden: 403 gets model-access copy, not the API-key copy", () => {
+    const r = formatProviderErrorMessage("OpenAI API error (403): model access denied");
+    expect(r.summary).toContain("won't allow this model");
+    expect(r.summary).not.toContain("Check your API key and model settings");
+  });
+
+  test("auth wins when a 401 body also carries permission wording", () => {
+    const r = formatProviderErrorMessage("401 Unauthorized: you do not have access");
+    expect(r.summary).toContain("Check your API key and model settings");
+  });
+
+  test("forbidden: model-access wording with no status code", () => {
+    const r = formatProviderErrorMessage("Project `proj_a` does not have access to model `o3`");
+    expect(r.summary).toContain("won't allow this model");
   });
 
   test("auth: invalid x-api-key", () => {
@@ -105,6 +234,24 @@ describe("formatProviderErrorMessage — structured code branching (Phase B)", (
     expect(r.summary).not.toContain("connection");
   });
 
+  test("forbidden code has its own copy, distinct from auth", () => {
+    const forbidden = formatProviderErrorMessage("permission denied", "forbidden");
+    const auth = formatProviderErrorMessage("invalid api key", "auth");
+    expect(forbidden.summary).toContain("won't allow this model");
+    expect(forbidden.summary).not.toBe(auth.summary);
+  });
+
+  test("structured code still outranks digits in the raw message", () => {
+    // A quota failure whose payload happens to carry a 403/401-looking token
+    // must stay in the rate-limit bucket.
+    const r = formatProviderErrorMessage(
+      '{"error":{"message":"quota exceeded"},"request_id":"req-403-xyz"}',
+      "rate_limit",
+    );
+    expect(r.summary).toContain("rate-limit");
+    expect(r.summary).not.toContain("won't allow this model");
+  });
+
   test("not_found has its own copy", () => {
     const r = formatProviderErrorMessage("model xyz does not exist", "not_found");
     expect(r.summary).toContain("couldn't find");
@@ -136,6 +283,11 @@ describe("formatProviderErrorMessage — status-code brittleness fix", () => {
     const r = formatProviderErrorMessage("context window exceeded at token 14018");
     // falls through to the generic fallback, not the auth-specific copy
     expect(r.summary).not.toContain("Check your API key and model settings");
+  });
+
+  test("does NOT match '403' embedded in unrelated digits", () => {
+    const r = formatProviderErrorMessage("prompt length was 4030 tokens");
+    expect(r.summary).not.toContain("won't allow this model");
   });
 
   test("does NOT match '429' embedded in unrelated digits", () => {
